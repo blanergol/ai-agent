@@ -63,7 +63,8 @@ const webUIPage = `<!doctype html>
       background: var(--surface-2);
       border-radius: var(--radius);
       padding: 14px;
-      display: grid;
+      display: flex;
+      flex-direction: column;
       gap: 10px;
     }
 
@@ -76,22 +77,26 @@ const webUIPage = `<!doctype html>
 
     .message {
       max-width: 92%;
+      width: auto;
+      height: auto;
+      display: inline-block;
       padding: 10px 12px;
       border-radius: 12px;
       white-space: pre-wrap;
-      word-wrap: break-word;
+      overflow-wrap: break-word;
+      word-break: break-word;
       line-height: 1.42;
       font-size: 15px;
     }
 
     .message.user {
-      margin-left: auto;
+      align-self: flex-end;
       background: #d8ebf7;
       border: 1px solid #b7d9ef;
     }
 
     .message.agent {
-      margin-right: auto;
+      align-self: flex-start;
       background: #ffffff;
       border: 1px solid #d8dfe5;
     }
@@ -110,9 +115,10 @@ const webUIPage = `<!doctype html>
 
     textarea {
       width: 100%;
-      min-height: 100px;
+      min-height: 48px;
       max-height: 240px;
       resize: none;
+      overflow-y: hidden;
       border-radius: 12px;
       border: 1px solid var(--border);
       padding: 12px;
@@ -226,9 +232,15 @@ const webUIPage = `<!doctype html>
       chat.scrollTop = chat.scrollHeight;
     };
 
+    const promptMinHeight = Number.parseFloat(getComputedStyle(promptEl).minHeight) || 48;
+    const promptMaxHeight = Number.parseFloat(getComputedStyle(promptEl).maxHeight) || 240;
+
     const autoResize = () => {
-      promptEl.style.height = "auto";
-      promptEl.style.height = String(Math.min(promptEl.scrollHeight, 240)) + "px";
+      promptEl.style.height = "0px";
+      const contentHeight = promptEl.scrollHeight;
+      const nextHeight = Math.max(promptMinHeight, Math.min(contentHeight, promptMaxHeight));
+      promptEl.style.height = String(nextHeight) + "px";
+      promptEl.style.overflowY = contentHeight > promptMaxHeight ? "auto" : "hidden";
     };
 
     promptEl.addEventListener("input", autoResize);
