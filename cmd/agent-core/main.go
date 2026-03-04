@@ -458,6 +458,7 @@ func buildRuntime(ctx context.Context, overrides runtimeOverrides) (*runtimeDepe
 			Scores:                  scores,
 			SnapshotStore:           agent.NewKVSnapshotStoreWithPolicy(store, retryPolicy),
 			SnapshotTimeout:         time.Duration(cfg.State.TimeoutMs) * time.Millisecond,
+			EnabledSkills:           cfg.Skills,
 		},
 		promptAdditions,
 	)

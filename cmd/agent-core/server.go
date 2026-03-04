@@ -69,6 +69,14 @@ type runResponse struct {
 	CorrelationID string `json:"correlation_id"`
 	// APIVersion возвращает версию публичного контракта результата агента.
 	APIVersion string `json:"api_version"`
+	// PlanningSteps возвращает детальный список шагов планирования.
+	PlanningSteps []agent.PlanningStep `json:"planning_steps,omitempty"`
+	// CalledTools возвращает список фактически вызванных инструментов.
+	CalledTools []string `json:"called_tools,omitempty"`
+	// MCPTools возвращает подмножество called_tools для MCP-инструментов.
+	MCPTools []string `json:"mcp_tools,omitempty"`
+	// Skills возвращает активные навыки runtime для текущего запуска.
+	Skills []string `json:"skills,omitempty"`
 }
 
 // errorResponse унифицирует JSON-формат ошибок API.
@@ -182,6 +190,10 @@ func (s *apiServer) handleRun(w http.ResponseWriter, r *http.Request) {
 		SessionID:     result.SessionID,
 		CorrelationID: result.CorrelationID,
 		APIVersion:    result.APIVersion,
+		PlanningSteps: result.PlanningSteps,
+		CalledTools:   result.CalledTools,
+		MCPTools:      result.MCPTools,
+		Skills:        result.Skills,
 	})
 
 	if claimed && s.onFirstHandled != nil {

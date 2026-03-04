@@ -40,6 +40,7 @@ type Agent struct {
 
 	outputValidator  output.Validator
 	promptHints      []string
+	enabledSkills    []string
 	observer         Observer
 	tracer           telemetry.Tracer
 	metrics          telemetry.Metrics
@@ -68,6 +69,7 @@ type RuntimeConfig struct {
 	SnapshotStore           SnapshotStore
 	SnapshotTimeout         time.Duration
 	Deterministic           bool
+	EnabledSkills           []string
 }
 
 // RunInput описывает строго типизированный контракт запуска агента.
@@ -94,6 +96,24 @@ type RunResult struct {
 	CorrelationID string
 	// APIVersion фиксирует версию публичного контракта результата.
 	APIVersion string
+	// PlanningSteps сохраняет пошаговые решения планировщика в рамках запуска.
+	PlanningSteps []PlanningStep
+	// CalledTools перечисляет уникальные фактически вызванные инструменты.
+	CalledTools []string
+	// MCPTools перечисляет вызванные инструменты с префиксом mcp.
+	MCPTools []string
+	// Skills перечисляет активные навыки runtime, участвующие в текущем запуске.
+	Skills []string
+}
+
+// PlanningStep описывает один шаг планирования перед выполнением действия.
+type PlanningStep struct {
+	Step             int    `json:"step"`
+	ActionType       string `json:"action_type"`
+	ToolName         string `json:"tool_name,omitempty"`
+	ReasoningSummary string `json:"reasoning_summary,omitempty"`
+	ExpectedOutcome  string `json:"expected_outcome,omitempty"`
+	Done             bool   `json:"done"`
 }
 
 // New создаёт Agent с совместимым legacy-контрактом и минимальной конфигурацией runtime.
@@ -172,6 +192,7 @@ func NewWithConfig(pl planner.Planner, mem *memory.Manager, st state.Store, tr *
 		outputValidationRetries: cfg.OutputValidationRetries,
 		outputValidator:         cfg.OutputValidator,
 		promptHints:             promptHints,
+		enabledSkills:           normalizeUniqueStrings(cfg.EnabledSkills),
 		observer:                cfg.Observer,
 		tracer:                  cfg.Tracer,
 		metrics:                 cfg.Metrics,
@@ -255,19 +276,29 @@ func (a *Agent) RunWithInput(ctx context.Context, in RunInput) (runResult RunRes
 
 	outputValidationAttempts := 0
 	actionRepeats := make(map[string]int)
+	planningSteps := make([]PlanningStep, 0, 8)
+	calledTools := make([]string, 0, 4)
+
+	buildRunResult := func(finalResponse string, steps int, toolCalls int, stopReason string) RunResult {
+		return RunResult{
+			FinalResponse: finalResponse,
+			Steps:         steps,
+			ToolCalls:     toolCalls,
+			StopReason:    stopReason,
+			SessionID:     session.SessionID,
+			CorrelationID: session.CorrelationID,
+			APIVersion:    APIVersion,
+			PlanningSteps: copyPlanningSteps(planningSteps),
+			CalledTools:   copyStrings(calledTools),
+			MCPTools:      mcpToolsFrom(calledTools),
+			Skills:        copyStrings(a.enabledSkills),
+		}
+	}
 
 	for {
 		if err := runGuardrails.BeforeStep(); err != nil {
 			steps, toolCalls, _ := runGuardrails.Stats()
-			result := RunResult{
-				FinalResponse: fallbackFinalResponse(redact.Error(err)),
-				Steps:         steps,
-				ToolCalls:     toolCalls,
-				StopReason:    redact.Error(err),
-				SessionID:     session.SessionID,
-				CorrelationID: session.CorrelationID,
-				APIVersion:    APIVersion,
-			}
+			result := buildRunResult(fallbackFinalResponse(redact.Error(err)), steps, toolCalls, redact.Error(err))
 			telemetry.ArtifactsFromContext(ctx).Save(ctx, telemetry.Artifact{
 				Kind:    telemetry.ArtifactState,
 				Name:    "agent.run_result",
@@ -291,20 +322,21 @@ func (a *Agent) RunWithInput(ctx context.Context, in RunInput) (runResult RunRes
 			spanErr = err
 			return RunResult{}, err
 		}
+
+		planningSteps = append(planningSteps, PlanningStep{
+			Step:             step,
+			ActionType:       strings.TrimSpace(next.Action.Type),
+			ToolName:         strings.TrimSpace(next.Action.ToolName),
+			ReasoningSummary: strings.TrimSpace(next.Action.ReasoningSummary),
+			ExpectedOutcome:  strings.TrimSpace(next.Action.ExpectedOutcome),
+			Done:             next.Done,
+		})
 		fingerprint := actionFingerprint(next.Action)
 		actionRepeats[fingerprint]++
 		if actionRepeats[fingerprint] > 3 {
 			cancel()
 			steps, toolCalls, _ := runGuardrails.Stats()
-			result := RunResult{
-				FinalResponse: fallbackFinalResponse("repeated_action_detected"),
-				Steps:         steps,
-				ToolCalls:     toolCalls,
-				StopReason:    "repeated_action_detected",
-				SessionID:     session.SessionID,
-				CorrelationID: session.CorrelationID,
-				APIVersion:    APIVersion,
-			}
+			result := buildRunResult(fallbackFinalResponse("repeated_action_detected"), steps, toolCalls, "repeated_action_detected")
 			telemetry.ArtifactsFromContext(ctx).Save(ctx, telemetry.Artifact{
 				Kind:    telemetry.ArtifactState,
 				Name:    "agent.run_result",
@@ -333,8 +365,11 @@ func (a *Agent) RunWithInput(ctx context.Context, in RunInput) (runResult RunRes
 			return RunResult{}, err
 		}
 
-		result, done, err := a.act(stepCtx, step, next, runMemory, runGuardrails)
+		result, done, invokedTool, err := a.act(stepCtx, step, next, runMemory, runGuardrails)
 		cancel()
+		if invokedTool != "" {
+			calledTools = appendUniqueString(calledTools, invokedTool)
+		}
 		if err != nil {
 			a.notify(ctx, Event{Type: EventRunFailed, Step: step, Error: redact.Error(err)})
 			spanErr = err
@@ -367,15 +402,7 @@ func (a *Agent) RunWithInput(ctx context.Context, in RunInput) (runResult RunRes
 			}
 
 			steps, toolCalls, _ := runGuardrails.Stats()
-			runResult := RunResult{
-				FinalResponse: finalResponse,
-				Steps:         steps,
-				ToolCalls:     toolCalls,
-				StopReason:    reason,
-				SessionID:     session.SessionID,
-				CorrelationID: session.CorrelationID,
-				APIVersion:    APIVersion,
-			}
+			runResult := buildRunResult(finalResponse, steps, toolCalls, reason)
 			telemetry.ArtifactsFromContext(ctx).Save(ctx, telemetry.Artifact{
 				Kind:    telemetry.ArtifactResponse,
 				Name:    "agent.final_response",
@@ -473,7 +500,7 @@ func (a *Agent) plan(ctx context.Context, userInput string, auth guardrails.User
 }
 
 // act исполняет выбранное действие планировщика и обновляет память/guardrails по результату.
-func (a *Agent) act(ctx context.Context, step int, next planner.NextAction, mem *memory.Manager, gr *guardrails.Guardrails) (result string, done bool, err error) {
+func (a *Agent) act(ctx context.Context, step int, next planner.NextAction, mem *memory.Manager, gr *guardrails.Guardrails) (result string, done bool, toolInvoked string, err error) {
 	ctx, span := telemetry.TracerFromContext(ctx).Start(ctx, "agent.act", map[string]any{"action": next.Action.Type})
 	var spanErr error
 	defer func() { span.End(spanErr) }()
@@ -482,9 +509,9 @@ func (a *Agent) act(ctx context.Context, step int, next planner.NextAction, mem 
 	case "final":
 		if err := mem.AddAssistantMessage(ctx, next.Action.FinalResponse); err != nil {
 			spanErr = err
-			return "", false, err
+			return "", false, "", err
 		}
-		return next.Action.FinalResponse, true, nil
+		return next.Action.FinalResponse, true, "", nil
 	case "noop":
 		if next.Done {
 			final := strings.TrimSpace(next.Action.FinalResponse)
@@ -496,22 +523,23 @@ func (a *Agent) act(ctx context.Context, step int, next planner.NextAction, mem 
 			}
 			if err := mem.AddAssistantMessage(ctx, final); err != nil {
 				spanErr = err
-				return "", false, err
+				return "", false, "", err
 			}
-			return final, true, nil
+			return final, true, "", nil
 		}
-		return "", false, nil
+		return "", false, "", nil
 	case "tool":
+		invokedTool := next.Action.ToolName
 		toolResult, err := a.tools.Execute(ctx, next.Action.ToolName, next.Action.ToolArgs)
 		if err != nil {
 			toolErrText := "error: " + redact.Error(err)
 			if grErr := gr.RecordToolCall(len(toolErrText)); grErr != nil {
 				spanErr = grErr
-				return "", false, grErr
+				return "", false, invokedTool, grErr
 			}
 			if memErr := mem.AddToolResult(ctx, next.Action.ToolName, toolErrText); memErr != nil {
 				spanErr = memErr
-				return "", false, memErr
+				return "", false, invokedTool, memErr
 			}
 
 			telemetry.NewContextLogger(ctx, a.logger).Warn(
@@ -530,18 +558,18 @@ func (a *Agent) act(ctx context.Context, step int, next planner.NextAction, mem 
 
 			decision := a.toolErrorPolicy.Decide(ctx, next.Action.ToolName, err)
 			if decision.Continue() {
-				return toolErrText, false, nil
+				return toolErrText, false, invokedTool, nil
 			}
 			spanErr = err
-			return "", false, err
+			return "", false, invokedTool, err
 		}
 		if err := gr.RecordToolCall(len(toolResult.Output)); err != nil {
 			spanErr = err
-			return "", false, err
+			return "", false, invokedTool, err
 		}
 		if err := mem.AddToolResult(ctx, next.Action.ToolName, toolResult.Output); err != nil {
 			spanErr = err
-			return "", false, err
+			return "", false, invokedTool, err
 		}
 		telemetry.NewContextLogger(ctx, a.logger).Debug(
 			"tool action complete",
@@ -559,15 +587,15 @@ func (a *Agent) act(ctx context.Context, step int, next planner.NextAction, mem 
 		if next.Done {
 			if err := mem.AddAssistantMessage(ctx, toolResult.Output); err != nil {
 				spanErr = err
-				return "", false, err
+				return "", false, invokedTool, err
 			}
-			return toolResult.Output, true, nil
+			return toolResult.Output, true, invokedTool, nil
 		}
-		return toolResult.Output, false, nil
+		return toolResult.Output, false, invokedTool, nil
 	default:
 		unsupported := apperrors.New(apperrors.CodeValidation, fmt.Sprintf("unsupported action type: %s", next.Action.Type), false)
 		spanErr = unsupported
-		return "", false, unsupported
+		return "", false, "", unsupported
 	}
 }
 
@@ -677,6 +705,58 @@ func actionFingerprint(action planner.Action) string {
 	raw, _ := json.Marshal(payload)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:8])
+}
+
+func appendUniqueString(values []string, raw string) []string {
+	candidate := strings.TrimSpace(raw)
+	if candidate == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == candidate {
+			return values
+		}
+	}
+	return append(values, candidate)
+}
+
+func normalizeUniqueStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = appendUniqueString(out, value)
+	}
+	return out
+}
+
+func copyStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, len(values))
+	copy(out, values)
+	return out
+}
+
+func copyPlanningSteps(values []PlanningStep) []PlanningStep {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]PlanningStep, len(values))
+	copy(out, values)
+	return out
+}
+
+func mcpToolsFrom(calledTools []string) []string {
+	out := make([]string, 0, len(calledTools))
+	for _, toolName := range calledTools {
+		if strings.HasPrefix(toolName, "mcp.") {
+			out = append(out, toolName)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func (a *Agent) emitRunScores(ctx context.Context, result RunResult, runErr error) {

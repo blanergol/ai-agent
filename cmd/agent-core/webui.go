@@ -44,7 +44,7 @@ const webUIPage = `<!doctype html>
     }
 
     .app {
-      width: min(920px, 100%);
+      width: min(1200px, 100%);
       display: grid;
       gap: 12px;
       background: color-mix(in srgb, var(--surface) 84%, transparent);
@@ -158,6 +158,16 @@ const webUIPage = `<!doctype html>
       background: #fff;
       font-size: 13px;
       color: var(--muted);
+      display: grid;
+      gap: 8px;
+    }
+
+    .status-head {
+      display: flex;
+      align-items: baseline;
+      flex-wrap: wrap;
+      column-gap: 8px;
+      row-gap: 4px;
     }
 
     .status strong {
@@ -165,7 +175,39 @@ const webUIPage = `<!doctype html>
       font-size: 12px;
       letter-spacing: 0.04em;
       text-transform: uppercase;
-      margin-right: 8px;
+      margin-right: 0;
+    }
+
+    .status-extra {
+      display: grid;
+      gap: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--border);
+    }
+
+    .status-extra[hidden] {
+      display: none;
+    }
+
+    .status-section-title {
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+      margin-bottom: 4px;
+    }
+
+    .status-list {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--text);
+      display: grid;
+      gap: 3px;
+    }
+
+    .status-list li {
+      line-height: 1.36;
     }
 
     .status.running strong { color: var(--warn); }
@@ -199,8 +241,11 @@ const webUIPage = `<!doctype html>
     </form>
 
     <div id="status" class="status idle">
-      <strong id="status-title">Статус</strong>
-      <span id="status-details">готов к запросу</span>
+      <div class="status-head">
+        <strong id="status-title">Статус</strong>
+        <span id="status-details">готов к запросу</span>
+      </div>
+      <div id="status-extra" class="status-extra" hidden></div>
     </div>
   </main>
 
@@ -213,12 +258,85 @@ const webUIPage = `<!doctype html>
     const statusEl = document.getElementById("status");
     const statusTitleEl = document.getElementById("status-title");
     const statusDetailsEl = document.getElementById("status-details");
+    const statusExtraEl = document.getElementById("status-extra");
 
-    const setStatus = (state, details) => {
+    const clearNode = (node) => {
+      while (node.firstChild) {
+        node.removeChild(node.firstChild);
+      }
+    };
+
+    const renderStatusSection = (title, values) => {
+      const section = document.createElement("section");
+      const sectionTitle = document.createElement("div");
+      sectionTitle.className = "status-section-title";
+      sectionTitle.textContent = title;
+      section.appendChild(sectionTitle);
+
+      const list = document.createElement("ul");
+      list.className = "status-list";
+      if (!Array.isArray(values) || values.length === 0) {
+        const item = document.createElement("li");
+        item.textContent = "(none)";
+        list.appendChild(item);
+      } else {
+        for (const value of values) {
+          const item = document.createElement("li");
+          item.textContent = value;
+          list.appendChild(item);
+        }
+      }
+      section.appendChild(list);
+      statusExtraEl.appendChild(section);
+    };
+
+    const formatPlanningStep = (step, index) => {
+      const stepNumber = step && Number.isInteger(step.step) ? step.step : (index + 1);
+      const actionType = step && typeof step.action_type === "string" && step.action_type ? step.action_type : "-";
+      const toolName = step && typeof step.tool_name === "string" ? step.tool_name : "";
+      const doneFlag = step && typeof step.done === "boolean" ? (step.done ? "done=true" : "done=false") : "";
+      const reasoning = step && typeof step.reasoning_summary === "string" ? step.reasoning_summary : "";
+      const expected = step && typeof step.expected_outcome === "string" ? step.expected_outcome : "";
+
+      const parts = ["#" + stepNumber, "action=" + actionType];
+      if (toolName) parts.push("tool=" + toolName);
+      if (doneFlag) parts.push(doneFlag);
+      if (reasoning) parts.push("why=" + reasoning);
+      if (expected) parts.push("expect=" + expected);
+      return parts.join(", ");
+    };
+
+    const renderStatusDetails = (meta) => {
+      clearNode(statusExtraEl);
+      if (!meta) {
+        statusExtraEl.hidden = true;
+        return;
+      }
+
+      const planningSteps = Array.isArray(meta.planningSteps)
+        ? meta.planningSteps.map((step, index) => formatPlanningStep(step, index))
+        : [];
+      const calledTools = Array.isArray(meta.calledTools) ? meta.calledTools : [];
+      const mcpTools = Array.isArray(meta.mcpTools) ? meta.mcpTools : [];
+      const skills = Array.isArray(meta.skills) ? meta.skills : [];
+
+      renderStatusSection("Called tools", calledTools);
+      renderStatusSection("MCP tools", mcpTools);
+      renderStatusSection("Skills", skills);
+      renderStatusSection("Planning steps", planningSteps);
+      statusExtraEl.hidden = false;
+    };
+
+    const setStatus = (state, details, meta = null) => {
       statusEl.className = "status " + state;
       const title = state === "running" ? "Выполняется" : state === "done" ? "Выполнен" : state === "error" ? "Ошибка" : "Статус";
       statusTitleEl.textContent = title;
       statusDetailsEl.textContent = details;
+      if (state === "done") {
+        renderStatusDetails(meta);
+      } else {
+        renderStatusDetails(null);
+      }
     };
 
     const addMessage = (role, text) => {
@@ -292,9 +410,19 @@ const webUIPage = `<!doctype html>
         const stopReason = payload && payload.stop_reason ? payload.stop_reason : "-";
         const sessionID = payload && payload.session_id ? payload.session_id : "-";
         const correlationID = payload && payload.correlation_id ? payload.correlation_id : "-";
+        const planningSteps = payload && Array.isArray(payload.planning_steps) ? payload.planning_steps : [];
+        const calledTools = payload && Array.isArray(payload.called_tools) ? payload.called_tools.filter((item) => typeof item === "string") : [];
+        const mcpTools = payload && Array.isArray(payload.mcp_tools) ? payload.mcp_tools.filter((item) => typeof item === "string") : [];
+        const skills = payload && Array.isArray(payload.skills) ? payload.skills.filter((item) => typeof item === "string") : [];
         setStatus(
           "done",
-          "HTTP " + response.status + ", " + elapsedMs + "ms, steps=" + steps + ", tool_calls=" + toolCalls + ", stop=" + stopReason + ", session=" + sessionID + ", correlation=" + correlationID
+          "HTTP " + response.status + ", " + elapsedMs + "ms, steps=" + steps + ", tool_calls=" + toolCalls + ", stop=" + stopReason + ", session=" + sessionID + ", correlation=" + correlationID,
+          {
+            planningSteps,
+            calledTools,
+            mcpTools,
+            skills
+          }
         );
       } catch (error) {
         const elapsedMs = Math.round(performance.now() - startedAt);
