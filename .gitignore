@@ -1,0 +1,30 @@
+# Binaries
+bin/
+dist/
+*.exe
+*.out
+
+# Build artifacts
+coverage.out
+*.test
+
+# IDE/editor
+.idea/
+.vscode/
+
+# Go
+/vendor/
+
+# OS
+.DS_Store
+tmp/
+.claude
+.ai/
+
+# Env
+.env
+
+# Observability runtime artifacts
+observability/shared-logs/*.log
+observability/state/*
+!observability/state/.gitkeep

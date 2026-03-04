@@ -1,0 +1,71 @@
+name: agent-core
+
+services:
+  agent-core:
+    container_name: agent-core
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - mkdir -p /var/log/agent && /app/agent-core serve --addr :8080 --first-only=false 2>&1 | tee -a /var/log/agent/agent-core.log
+    environment:
+      AGENT_CORE_MODE: ${AGENT_CORE_MODE:-dev}
+      AGENT_CORE_LLM_PROVIDER: ${AGENT_CORE_LLM_PROVIDER:-ollama}
+      AGENT_CORE_LLM_MODEL: ${AGENT_CORE_LLM_MODEL:-llama3.1}
+      AGENT_CORE_LLM_BASE_URL: ${AGENT_CORE_LLM_BASE_URL:-http://host.docker.internal:11434}
+      AGENT_CORE_LLM_OPENAI_API_KEY: ${AGENT_CORE_LLM_OPENAI_API_KEY:-}
+      AGENT_CORE_LLM_OPENROUTER_API_KEY: ${AGENT_CORE_LLM_OPENROUTER_API_KEY:-}
+      AGENT_CORE_LLM_OPENROUTER_HTTP_REFERER: ${AGENT_CORE_LLM_OPENROUTER_HTTP_REFERER:-}
+      AGENT_CORE_LLM_OPENROUTER_APP_TITLE: ${AGENT_CORE_LLM_OPENROUTER_APP_TITLE:-}
+      AGENT_CORE_LLM_MAX_OUTPUT_TOKENS: ${AGENT_CORE_LLM_MAX_OUTPUT_TOKENS:-1024}
+      AGENT_CORE_LLM_TIMEOUT_MS: ${AGENT_CORE_LLM_TIMEOUT_MS:-20000}
+      AGENT_CORE_LLM_MAX_RETRIES: ${AGENT_CORE_LLM_MAX_RETRIES:-3}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      AGENT_CORE_LANGFUSE_ENABLED: ${AGENT_CORE_LANGFUSE_ENABLED:-true}
+      AGENT_CORE_LANGFUSE_HOST: ${AGENT_CORE_LANGFUSE_HOST:-http://langfuse-web:3000}
+      AGENT_CORE_LANGFUSE_PUBLIC_KEY: ${AGENT_CORE_LANGFUSE_PUBLIC_KEY:-lf_pk_default_public_key}
+      AGENT_CORE_LANGFUSE_SECRET_KEY: ${AGENT_CORE_LANGFUSE_SECRET_KEY:-lf_sk_default_secret_key}
+      AGENT_CORE_LANGFUSE_TIMEOUT_MS: ${AGENT_CORE_LANGFUSE_TIMEOUT_MS:-10000}
+      AGENT_CORE_LANGFUSE_SERVICE_NAME: ${AGENT_CORE_LANGFUSE_SERVICE_NAME:-agent-core}
+      AGENT_CORE_LANGFUSE_SERVICE_VERSION: ${AGENT_CORE_LANGFUSE_SERVICE_VERSION:-}
+      AGENT_CORE_LANGFUSE_ENVIRONMENT: ${AGENT_CORE_LANGFUSE_ENVIRONMENT:-dev}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse-web:3000}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-lf_pk_default_public_key}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-lf_sk_default_secret_key}
+      AGENT_CORE_SKILLS: ${AGENT_CORE_SKILLS:-ops}
+      AGENT_CORE_TOOLS_ALLOWLIST: ${AGENT_CORE_TOOLS_ALLOWLIST:-time.now,kv.put,kv.get,http.get}
+      AGENT_CORE_TOOLS_HTTP_ALLOW_DOMAINS: ${AGENT_CORE_TOOLS_HTTP_ALLOW_DOMAINS:-example.com,api.github.com}
+      AGENT_CORE_STATE_PERSIST_PATH: ${AGENT_CORE_STATE_PERSIST_PATH:-/app/state/state.json}
+      AGENT_CORE_STATE_CACHE_BACKPLANE_DIR: ${AGENT_CORE_STATE_CACHE_BACKPLANE_DIR:-/app/state/cache-backplane}
+      AGENT_CORE_AGENT_MAX_STEP_DURATION_MS: ${AGENT_CORE_AGENT_MAX_STEP_DURATION_MS:-20000}
+      AGENT_CORE_LOGGING_DEBUG: ${AGENT_CORE_LOGGING_DEBUG:-true}
+      AGENT_CORE_LOGGING_VERBOSE_TRACING: ${AGENT_CORE_LOGGING_VERBOSE_TRACING:-true}
+      AGENT_CORE_LOGGING_DEBUG_ARTIFACTS: ${AGENT_CORE_LOGGING_DEBUG_ARTIFACTS:-true}
+      AGENT_CORE_LOGGING_DEBUG_ARTIFACTS_MAX_CHARS: ${AGENT_CORE_LOGGING_DEBUG_ARTIFACTS_MAX_CHARS:-4000}
+      AGENT_CORE_WEB_UI_ENABLED: ${AGENT_CORE_WEB_UI_ENABLED:-true}
+      AGENT_CORE_MCP_ENABLED: ${AGENT_CORE_MCP_ENABLED:-false}
+      AGENT_CORE_MCP_SERVERS: ${AGENT_CORE_MCP_SERVERS:-}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./observability/shared-logs:/var/log/agent
+      - ./observability/state:/app/state
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8080/healthz | grep -q ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - observability
+
+networks:
+  observability:
+    name: agent-observability
+    driver: bridge

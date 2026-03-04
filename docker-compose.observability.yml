@@ -1,0 +1,330 @@
+name: agent-core
+
+services:
+  loki:
+    container_name: loki
+    image: grafana/loki:3.2.1
+    command: -config.file=/etc/loki/config.yaml
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki/loki-config.yaml:/etc/loki/config.yaml:ro
+      - loki_data:/loki
+    networks:
+      - observability
+
+  promtail:
+    container_name: promtail
+    image: grafana/promtail:3.2.1
+    command: -config.file=/etc/promtail/config.yaml
+    restart: unless-stopped
+    depends_on:
+      - loki
+    volumes:
+      - ./observability/promtail/promtail-config.yaml:/etc/promtail/config.yaml:ro
+      - ./observability/shared-logs:/var/log/agent:ro
+      - promtail_positions:/tmp
+    networks:
+      - observability
+
+  jaeger:
+    container_name: jaeger
+    image: jaegertracing/all-in-one:1.65.0
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+      - "14269:14269"
+    networks:
+      - observability
+
+  otel-collector:
+    container_name: otel-collector
+    image: otel/opentelemetry-collector-contrib:0.121.0
+    command: ["--config=/etc/otel-collector/config.yaml"]
+    restart: unless-stopped
+    depends_on:
+      - jaeger
+    ports:
+      - "4319:4317"
+      - "4320:4318"
+    volumes:
+      - ./observability/otel-collector/config.yaml:/etc/otel-collector/config.yaml:ro
+    networks:
+      - observability
+
+  prometheus:
+    container_name: prometheus
+    image: prom/prometheus:v3.2.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - observability
+
+  grafana:
+    container_name: grafana
+    image: grafana/grafana:11.6.0
+    restart: unless-stopped
+    depends_on:
+      - loki
+      - prometheus
+      - jaeger
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    networks:
+      - observability
+
+  langfuse-postgres:
+    container_name: langfuse-postgres
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    networks:
+      - observability
+
+  langfuse-redis:
+    container_name: langfuse-redis
+    image: redis:7
+    command: >
+      --requirepass redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 20
+    volumes:
+      - langfuse_redis_data:/data
+    networks:
+      - observability
+
+  langfuse-clickhouse:
+    container_name: langfuse-clickhouse
+    image: clickhouse/clickhouse-server:24.3.3.102
+    user: "101:101"
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 -O - http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+      - ./observability/langfuse/clickhouse/init/cluster_1_shard_1_replica.sql:/docker-entrypoint-initdb.d/cluster_1_shard_1_replica.sql:ro
+      - ./observability/langfuse/clickhouse/init/000-init.sql:/docker-entrypoint-initdb.d/000-init.sql:ro
+    networks:
+      - observability
+
+  langfuse-minio:
+    container_name: langfuse-minio
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    ports:
+      - "9092:9001"
+    volumes:
+      - langfuse_minio_data:/data
+    networks:
+      - observability
+
+  langfuse-minio-init:
+    container_name: langfuse-minio-init
+    image: minio/mc
+    restart: "no"
+    depends_on:
+      langfuse-minio:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - |
+        until /usr/bin/mc alias set local http://langfuse-minio:9000 minio miniosecret; do
+          echo "waiting for minio..."
+          sleep 2
+        done
+        /usr/bin/mc mb --ignore-existing local/langfuse
+        echo "langfuse bucket ready"
+    networks:
+      - observability
+
+  langfuse-worker:
+    container_name: langfuse-worker
+    image: langfuse/langfuse-worker:3
+    restart: unless-stopped
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_started
+      langfuse-minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "3030:3030"
+    environment: &langfuse-common-env
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
+      SALT: langfuse-salt-change-me
+      ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      TELEMETRY_ENABLED: "true"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-default-org}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-Default Organization}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-default-project}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-Default Project}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-lf_pk_default_public_key}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-lf_sk_default_secret_key}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@local.dev}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-adminadmin}
+      LANGFUSE_DEFAULT_ORG_ID: ${LANGFUSE_DEFAULT_ORG_ID:-default-org}
+      LANGFUSE_DEFAULT_ORG_ROLE: ${LANGFUSE_DEFAULT_ORG_ROLE:-OWNER}
+      LANGFUSE_DEFAULT_PROJECT_ID: ${LANGFUSE_DEFAULT_PROJECT_ID:-default-project}
+      LANGFUSE_DEFAULT_PROJECT_ROLE: ${LANGFUSE_DEFAULT_PROJECT_ROLE:-OWNER}
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_CONNECTION_STRING: redis://:redis@langfuse-redis:6379
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: super-secret-auth-secret
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+    networks:
+      - observability
+
+  langfuse-web:
+    container_name: langfuse-web
+    image: langfuse/langfuse:3
+    restart: unless-stopped
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_started
+      langfuse-minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "3000:3000"
+    environment:
+      <<: *langfuse-common-env
+      HOSTNAME: 0.0.0.0
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 -O - http://127.0.0.1:3000/api/public/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    networks:
+      - observability
+
+  langfuse-bootstrap:
+    container_name: langfuse-bootstrap
+    image: postgres:16
+    restart: on-failure
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-web:
+        condition: service_healthy
+    environment:
+      PGHOST: langfuse-postgres
+      PGPORT: "5432"
+      PGUSER: langfuse
+      PGPASSWORD: langfuse
+      PGDATABASE: langfuse
+      LANGFUSE_BOOTSTRAP_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-default-org}
+      LANGFUSE_BOOTSTRAP_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-Default Organization}
+      LANGFUSE_BOOTSTRAP_ORG_ROLE: ${LANGFUSE_DEFAULT_ORG_ROLE:-OWNER}
+      LANGFUSE_BOOTSTRAP_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-default-project}
+      LANGFUSE_BOOTSTRAP_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-Default Project}
+      LANGFUSE_BOOTSTRAP_PROJECT_ROLE: ${LANGFUSE_DEFAULT_PROJECT_ROLE:-OWNER}
+    volumes:
+      - ./observability/langfuse/bootstrap/langfuse-bootstrap.sql:/bootstrap/langfuse-bootstrap.sql:ro
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - |
+        until pg_isready -h "$$PGHOST" -p "$$PGPORT" -U "$$PGUSER" -d "$$PGDATABASE"; do
+          echo "waiting for langfuse-postgres..."
+          sleep 2
+        done
+        psql -v ON_ERROR_STOP=1 \
+          -v ORG_ID="$$LANGFUSE_BOOTSTRAP_ORG_ID" \
+          -v ORG_NAME="$$LANGFUSE_BOOTSTRAP_ORG_NAME" \
+          -v ORG_ROLE="$$LANGFUSE_BOOTSTRAP_ORG_ROLE" \
+          -v PROJECT_ID="$$LANGFUSE_BOOTSTRAP_PROJECT_ID" \
+          -v PROJECT_NAME="$$LANGFUSE_BOOTSTRAP_PROJECT_NAME" \
+          -v PROJECT_ROLE="$$LANGFUSE_BOOTSTRAP_PROJECT_ROLE" \
+          -f /bootstrap/langfuse-bootstrap.sql
+        echo "langfuse bootstrap completed"
+    networks:
+      - observability
+
+networks:
+  observability:
+    name: agent-observability
+    driver: bridge
+
+volumes:
+  loki_data:
+  promtail_positions:
+  prometheus_data:
+  grafana_data:
+  langfuse_postgres_data:
+  langfuse_redis_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
