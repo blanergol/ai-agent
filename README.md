@@ -423,11 +423,16 @@ Important variables are grouped below. For complete behavior, check `config/Defa
     ```json
     [{"name":"local","base_url":"http://localhost:8787","enabled":true,"token":""}]
     ```
+  - OAuth 2.1 JSON example (client credentials):
+    ```json
+    [{"name":"obs","base_url":"https://mcp.internal","enabled":true,"oauth2_1":{"enabled":true,"issuer_url":"https://idp.example.com","client_id":"agent-core","audience":"mcp-api","scopes":["mcp.read","mcp.call"],"auth_method":"client_secret_basic"}}]
+    ```
   - KV example:
     ```text
     name=local,base_url=http://localhost:8787,enabled=true
     ```
 - secret fallback: `MCP_TOKEN_<SERVER_NAME>`
+- oauth secret fallbacks: `MCP_OAUTH_CLIENT_ID_<SERVER_NAME>`, `MCP_OAUTH_CLIENT_SECRET_<SERVER_NAME>`
 
 Deterministic enrichment sources example:
 
@@ -475,6 +480,16 @@ If `CACHE_BACKPLANE_DIR` is empty but `PERSIST_PATH` is set, cache-backplane pat
 ### Auth / Logging / Skills
 
 - `AGENT_CORE_AUTH_USER_AUTH_HEADER`
+- `AGENT_CORE_AUTH_OAUTH2_1_ENABLED`
+- `AGENT_CORE_AUTH_OAUTH2_1_ISSUER_URL`
+- `AGENT_CORE_AUTH_OAUTH2_1_JWKS_URL` (optional if issuer discovery is enabled)
+- `AGENT_CORE_AUTH_OAUTH2_1_AUDIENCE`
+- `AGENT_CORE_AUTH_OAUTH2_1_REQUIRED_SCOPES` (CSV)
+- `AGENT_CORE_AUTH_OAUTH2_1_ALLOWED_ALGS` (CSV)
+- `AGENT_CORE_AUTH_OAUTH2_1_CLOCK_SKEW_SEC`
+- `AGENT_CORE_AUTH_OAUTH2_1_SUBJECT_CLAIM`
+- `AGENT_CORE_AUTH_OAUTH2_1_SCOPE_CLAIM`
+- `AGENT_CORE_AUTH_OAUTH2_1_ALLOW_INSECURE_HTTP`
 - `AGENT_CORE_LOGGING_DEBUG`
 - `AGENT_CORE_LOGGING_VERBOSE_TRACING`
 - `AGENT_CORE_LOGGING_DEBUG_ARTIFACTS`
@@ -771,7 +786,9 @@ Then:
 
 1. Enable `AGENT_CORE_MCP_ENABLED=true`
 2. Configure `AGENT_CORE_MCP_SERVERS`
-3. (Optional) provide tokens via `MCP_TOKEN_<SERVER>`
+3. Choose auth mode per server:
+   - static bearer via `token` / `MCP_TOKEN_<SERVER>`
+   - OAuth 2.1 client credentials via `oauth2_1` config (+ optional `MCP_OAUTH_CLIENT_SECRET_<SERVER>`)
 
 After import, tools are available as `mcp.<server>.<tool>`.
 
@@ -1072,8 +1089,8 @@ Configuration:
 ```powershell
 $env:AGENT_CORE_SKILLS="ops"
 $env:AGENT_CORE_MCP_ENABLED="true"
-$env:AGENT_CORE_MCP_SERVERS='[{"name":"obs","base_url":"http://mcp-observability.internal","enabled":true}]'
-$env:MCP_TOKEN_OBS="<secret>"
+$env:AGENT_CORE_MCP_SERVERS='[{"name":"obs","base_url":"https://mcp-observability.internal","enabled":true,"oauth2_1":{"enabled":true,"issuer_url":"https://idp.internal","client_id":"agent-core","audience":"mcp-observability","scopes":["mcp.read","mcp.call"],"auth_method":"client_secret_basic"}}]'
+$env:MCP_OAUTH_CLIENT_SECRET_OBS="<secret>"
 $env:AGENT_CORE_TOOLS_ALLOWLIST="time.now,http.get,mcp.obs.monitoring.query,mcp.obs.logs.search,mcp.obs.deployments.last_change"
 ```
 

@@ -3,6 +3,7 @@ module github.com/blanergol/agent-core
 go 1.25.1
 
 require (
+	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/spf13/cobra v1.8.1
 	github.com/tmc/langchaingo v0.1.13
 	github.com/xeipuuv/gojsonschema v1.2.0

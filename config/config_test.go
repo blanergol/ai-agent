@@ -143,6 +143,81 @@ func TestLoadParsesMCPEnrichmentSources(t *testing.T) {
 	}
 }
 
+func TestLoadParsesAuthOAuth21Config(t *testing.T) {
+	t.Setenv("AGENT_CORE_MODE", "test")
+	t.Setenv("AGENT_CORE_AUTH_OAUTH2_1_ENABLED", "true")
+	t.Setenv("AGENT_CORE_AUTH_OAUTH2_1_ISSUER_URL", "http://localhost:9000")
+	t.Setenv("AGENT_CORE_AUTH_OAUTH2_1_AUDIENCE", "agent-core")
+	t.Setenv("AGENT_CORE_AUTH_OAUTH2_1_REQUIRED_SCOPES", "agent.run,mcp.read")
+	t.Setenv("AGENT_CORE_AUTH_OAUTH2_1_ALLOWED_ALGS", "RS256,ES256")
+	t.Setenv("AGENT_CORE_AUTH_OAUTH2_1_CLOCK_SKEW_SEC", "120")
+	t.Setenv("AGENT_CORE_AUTH_OAUTH2_1_ALLOW_INSECURE_HTTP", "true")
+	t.Setenv("AGENT_CORE_AUTH_OAUTH2_1_SUBJECT_CLAIM", "sub")
+	t.Setenv("AGENT_CORE_AUTH_OAUTH2_1_SCOPE_CLAIM", "scope")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load error: %v", err)
+	}
+	if !cfg.Auth.OAuth21.Enabled {
+		t.Fatalf("auth.oauth2_1.enabled = %t, want true", cfg.Auth.OAuth21.Enabled)
+	}
+	if cfg.Auth.OAuth21.IssuerURL != "http://localhost:9000" {
+		t.Fatalf("issuer_url = %s", cfg.Auth.OAuth21.IssuerURL)
+	}
+	if cfg.Auth.OAuth21.Audience != "agent-core" {
+		t.Fatalf("audience = %s", cfg.Auth.OAuth21.Audience)
+	}
+	if len(cfg.Auth.OAuth21.RequiredScopes) != 2 {
+		t.Fatalf("required_scopes len = %d, want 2", len(cfg.Auth.OAuth21.RequiredScopes))
+	}
+	if len(cfg.Auth.OAuth21.AllowedAlgs) != 2 {
+		t.Fatalf("allowed_algs len = %d, want 2", len(cfg.Auth.OAuth21.AllowedAlgs))
+	}
+	if cfg.Auth.OAuth21.ClockSkewSec != 120 {
+		t.Fatalf("clock_skew_sec = %d, want 120", cfg.Auth.OAuth21.ClockSkewSec)
+	}
+}
+
+func TestLoadAuthOAuth21RequiresAudience(t *testing.T) {
+	t.Setenv("AGENT_CORE_MODE", "test")
+	t.Setenv("AGENT_CORE_AUTH_OAUTH2_1_ENABLED", "true")
+	t.Setenv("AGENT_CORE_AUTH_OAUTH2_1_ALLOW_INSECURE_HTTP", "true")
+	t.Setenv("AGENT_CORE_AUTH_OAUTH2_1_ISSUER_URL", "http://localhost:9000")
+	t.Setenv("AGENT_CORE_AUTH_OAUTH2_1_AUDIENCE", "")
+
+	if _, err := Load(); err == nil {
+		t.Fatalf("expected missing audience error")
+	}
+}
+
+func TestLoadMCPServerOAuthSecretFallback(t *testing.T) {
+	t.Setenv("AGENT_CORE_MODE", "test")
+	t.Setenv(
+		"AGENT_CORE_MCP_SERVERS",
+		`[{"name":"obs","base_url":"http://localhost:8787","enabled":true,"oauth2_1":{"enabled":true,"issuer_url":"http://localhost:9000","client_id":"agent-core","allow_insecure_http":true}}]`,
+	)
+	t.Setenv("MCP_OAUTH_CLIENT_SECRET_OBS", "oauth-secret")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load error: %v", err)
+	}
+	if len(cfg.MCP.Servers) != 1 {
+		t.Fatalf("mcp servers len = %d", len(cfg.MCP.Servers))
+	}
+	server := cfg.MCP.Servers[0]
+	if !server.OAuth21.Enabled {
+		t.Fatalf("oauth2_1.enabled = %t, want true", server.OAuth21.Enabled)
+	}
+	if server.OAuth21.ClientSecret != "oauth-secret" {
+		t.Fatalf("oauth2_1.client_secret = %s", server.OAuth21.ClientSecret)
+	}
+	if server.OAuth21.AuthMethod != "client_secret_basic" {
+		t.Fatalf("oauth2_1.auth_method = %s, want client_secret_basic", server.OAuth21.AuthMethod)
+	}
+}
+
 // TestLoadDerivesCacheBackplaneDirFromPersistPath проверяет автогенерацию cache_backplane_dir от persist_path.
 func TestLoadDerivesCacheBackplaneDirFromPersistPath(t *testing.T) {
 	t.Setenv("AGENT_CORE_MODE", "test")

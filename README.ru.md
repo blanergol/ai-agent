@@ -413,11 +413,16 @@ runtime := core.NewRuntime(cfg, core.RuntimeDeps{
     ```json
     [{"name":"local","base_url":"http://localhost:8787","enabled":true,"token":""}]
     ```
+  - OAuth 2.1 JSON пример (client credentials):
+    ```json
+    [{"name":"obs","base_url":"https://mcp.internal","enabled":true,"oauth2_1":{"enabled":true,"issuer_url":"https://idp.example.com","client_id":"agent-core","audience":"mcp-api","scopes":["mcp.read","mcp.call"],"auth_method":"client_secret_basic"}}]
+    ```
   - KV пример:
     ```text
     name=local,base_url=http://localhost:8787,enabled=true
     ```
 - secret fallback: `MCP_TOKEN_<SERVER_NAME>`
+- oauth secret fallbacks: `MCP_OAUTH_CLIENT_ID_<SERVER_NAME>`, `MCP_OAUTH_CLIENT_SECRET_<SERVER_NAME>`
 - детерминированное pre-plan enrichment:
   - `AGENT_CORE_AGENT_MCP_ENRICHMENT_SOURCES` (JSON array), пример:
     ```json
@@ -466,6 +471,16 @@ runtime := core.NewRuntime(cfg, core.RuntimeDeps{
 ### Auth / Logging / Skills
 
 - `AGENT_CORE_AUTH_USER_AUTH_HEADER` (по умолчанию `X-User-Sub`)
+- `AGENT_CORE_AUTH_OAUTH2_1_ENABLED`
+- `AGENT_CORE_AUTH_OAUTH2_1_ISSUER_URL`
+- `AGENT_CORE_AUTH_OAUTH2_1_JWKS_URL` (опционально, если используется issuer discovery)
+- `AGENT_CORE_AUTH_OAUTH2_1_AUDIENCE`
+- `AGENT_CORE_AUTH_OAUTH2_1_REQUIRED_SCOPES` (CSV)
+- `AGENT_CORE_AUTH_OAUTH2_1_ALLOWED_ALGS` (CSV)
+- `AGENT_CORE_AUTH_OAUTH2_1_CLOCK_SKEW_SEC`
+- `AGENT_CORE_AUTH_OAUTH2_1_SUBJECT_CLAIM`
+- `AGENT_CORE_AUTH_OAUTH2_1_SCOPE_CLAIM`
+- `AGENT_CORE_AUTH_OAUTH2_1_ALLOW_INSECURE_HTTP`
 - `AGENT_CORE_LOGGING_DEBUG`
 - `AGENT_CORE_LOGGING_VERBOSE_TRACING`
 - `AGENT_CORE_LOGGING_DEBUG_ARTIFACTS`
@@ -780,7 +795,9 @@ func (s *SupportSkill) PromptAdditions() []string {
 
 1. Включить `AGENT_CORE_MCP_ENABLED=true`
 2. Настроить `AGENT_CORE_MCP_SERVERS`
-3. (Опционально) передать токены через `MCP_TOKEN_<SERVER>`
+3. Выбрать режим auth для сервера:
+   - статический bearer через `token` / `MCP_TOKEN_<SERVER>`
+   - OAuth 2.1 client credentials через `oauth2_1` (+ опционально `MCP_OAUTH_CLIENT_SECRET_<SERVER>`)
 
 После импорта инструменты доступны как `mcp.<server>.<tool>`.
 
@@ -1081,8 +1098,8 @@ $env:AGENT_CORE_TOOLS_MAX_OUTPUT_BYTES="32768"
 ```powershell
 $env:AGENT_CORE_SKILLS="ops"
 $env:AGENT_CORE_MCP_ENABLED="true"
-$env:AGENT_CORE_MCP_SERVERS='[{"name":"obs","base_url":"http://mcp-observability.internal","enabled":true}]'
-$env:MCP_TOKEN_OBS="<secret>"
+$env:AGENT_CORE_MCP_SERVERS='[{"name":"obs","base_url":"https://mcp-observability.internal","enabled":true,"oauth2_1":{"enabled":true,"issuer_url":"https://idp.internal","client_id":"agent-core","audience":"mcp-observability","scopes":["mcp.read","mcp.call"],"auth_method":"client_secret_basic"}}]'
+$env:MCP_OAUTH_CLIENT_SECRET_OBS="<secret>"
 $env:AGENT_CORE_TOOLS_ALLOWLIST="time.now,http.get,mcp.obs.monitoring.query,mcp.obs.logs.search,mcp.obs.deployments.last_change"
 ```
 

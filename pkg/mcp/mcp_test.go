@@ -13,6 +13,20 @@ import (
 	"github.com/blanergol/agent-core/pkg/retry"
 )
 
+type fakeTokenSource struct {
+	token string
+	err   error
+	calls int32
+}
+
+func (f *fakeTokenSource) AccessToken(_ context.Context) (string, error) {
+	atomic.AddInt32(&f.calls, 1)
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.token, nil
+}
+
 // TestHTTPClientListToolsRetriesTransient проверяет общий retry/backoff контракт для list-tools при 5xx.
 func TestHTTPClientListToolsRetriesTransient(t *testing.T) {
 	var calls int32
@@ -119,5 +133,36 @@ func TestHTTPClientCallToolDoesNotRetryAuthErrors(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("calls = %d, want 1 for non-retryable auth failure", calls)
+	}
+}
+
+func TestHTTPClientCallToolOAuthAuthenticator(t *testing.T) {
+	var authHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/tools/echo" {
+			http.NotFound(w, r)
+			return
+		}
+		authHeader = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(map[string]any{"output": "ok"})
+	}))
+	defer srv.Close()
+
+	tokenSource := &fakeTokenSource{token: "oauth-token"}
+	client := NewHTTPClientWithAuthenticator(
+		srv.URL,
+		NewOAuthBearerAuthenticator(tokenSource),
+		500*time.Millisecond,
+		retry.Policy{DisableJitter: true},
+	)
+	_, err := client.CallTool(context.Background(), "echo", json.RawMessage(`{"q":"hello"}`))
+	if err != nil {
+		t.Fatalf("CallTool returned error: %v", err)
+	}
+	if authHeader != "Bearer oauth-token" {
+		t.Fatalf("Authorization header = %q", authHeader)
+	}
+	if tokenSource.calls != 1 {
+		t.Fatalf("token source calls = %d, want 1", tokenSource.calls)
 	}
 }

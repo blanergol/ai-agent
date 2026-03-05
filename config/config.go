@@ -3,6 +3,8 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -161,13 +163,63 @@ type MCPConfig struct {
 // MCPServerConfig описывает подключение к одному внешнему MCP-серверу.
 type MCPServerConfig struct {
 	// Name используется в префиксе инструментов `mcp.<name>.*`.
-	Name string `mapstructure:"name"`
+	Name string `json:"name" mapstructure:"name"`
 	// BaseURL задаёт корневой HTTP endpoint MCP-сервера.
-	BaseURL string `mapstructure:"base_url"`
+	BaseURL string `json:"base_url" mapstructure:"base_url"`
 	// Token содержит bearer-токен для авторизации к MCP-серверу.
-	Token string `mapstructure:"token"`
+	Token string `json:"token" mapstructure:"token"`
+	// OAuth21 включает OAuth 2.1 client credentials для MCP-сервера.
+	OAuth21 OAuth21ClientConfig `json:"oauth2_1" mapstructure:"oauth2_1"`
 	// Enabled позволяет точечно включать/выключать конкретный сервер.
-	Enabled bool `mapstructure:"enabled"`
+	Enabled bool `json:"enabled" mapstructure:"enabled"`
+}
+
+// OAuth21ClientConfig описывает OAuth 2.1 client credentials-конфигурацию исходящих запросов.
+type OAuth21ClientConfig struct {
+	// Enabled включает OAuth 2.1 client credentials для конкретного MCP-сервера.
+	Enabled bool `json:"enabled" mapstructure:"enabled"`
+	// IssuerURL задаёт issuer URL для OIDC discovery (`/.well-known/openid-configuration`).
+	IssuerURL string `json:"issuer_url" mapstructure:"issuer_url"`
+	// TokenURL задаёт явный token endpoint (если discovery не используется).
+	TokenURL string `json:"token_url" mapstructure:"token_url"`
+	// ClientID задаёт OAuth client_id.
+	ClientID string `json:"client_id" mapstructure:"client_id"`
+	// ClientSecret задаёт OAuth client_secret.
+	ClientSecret string `json:"client_secret" mapstructure:"client_secret"`
+	// Audience задаёт целевой audience параметр token endpoint (если поддерживается IdP).
+	Audience string `json:"audience" mapstructure:"audience"`
+	// Scopes задаёт запрашиваемые OAuth scopes.
+	Scopes []string `json:"scopes" mapstructure:"scopes"`
+	// AuthMethod задаёт способ аутентификации клиента: client_secret_basic|client_secret_post|none.
+	AuthMethod string `json:"auth_method" mapstructure:"auth_method"`
+	// ClockSkewSec задаёт запас в секундах перед фактическим истечением токена.
+	ClockSkewSec int `json:"clock_skew_sec" mapstructure:"clock_skew_sec"`
+	// AllowInsecureHTTP разрешает http endpoint-ы (обычно только для localhost/dev).
+	AllowInsecureHTTP bool `json:"allow_insecure_http" mapstructure:"allow_insecure_http"`
+}
+
+// OAuth21ResourceServerConfig describes OAuth 2.1 resource-server verification settings.
+type OAuth21ResourceServerConfig struct {
+	// Enabled включает проверку bearer access token для входящих HTTP-запросов.
+	Enabled bool `json:"enabled" mapstructure:"enabled"`
+	// IssuerURL задаёт issuer URL для проверки токена и OIDC discovery.
+	IssuerURL string `json:"issuer_url" mapstructure:"issuer_url"`
+	// JWKSURL задаёт явный JWKS endpoint (если discovery не используется).
+	JWKSURL string `json:"jwks_url" mapstructure:"jwks_url"`
+	// Audience задаёт ожидаемую аудиторию access token.
+	Audience string `json:"audience" mapstructure:"audience"`
+	// RequiredScopes задаёт минимальный набор scopes, обязательный для вызова API.
+	RequiredScopes []string `json:"required_scopes" mapstructure:"required_scopes"`
+	// AllowedAlgs ограничивает допустимые JWT подписи (например RS256, ES256).
+	AllowedAlgs []string `json:"allowed_algs" mapstructure:"allowed_algs"`
+	// ClockSkewSec задаёт допустимый сдвиг времени при проверке exp/nbf/iat.
+	ClockSkewSec int `json:"clock_skew_sec" mapstructure:"clock_skew_sec"`
+	// SubjectClaim задаёт claim, который считается user subject (по умолчанию `sub`).
+	SubjectClaim string `json:"subject_claim" mapstructure:"subject_claim"`
+	// ScopeClaim задаёт claim со scope-значениями (по умолчанию `scope`).
+	ScopeClaim string `json:"scope_claim" mapstructure:"scope_claim"`
+	// AllowInsecureHTTP разрешает http endpoints issuer/jwks (обычно только localhost/dev).
+	AllowInsecureHTTP bool `json:"allow_insecure_http" mapstructure:"allow_insecure_http"`
 }
 
 // StateConfig управляет персистентностью state и общим cache backplane.
@@ -234,6 +286,8 @@ type OutputConfig struct {
 type AuthConfig struct {
 	// UserAuthHeader задаёт имя HTTP-заголовка с user subject.
 	UserAuthHeader string `mapstructure:"user_auth_header"`
+	// OAuth21 включает OAuth 2.1 валидацию bearer access token на входящем HTTP API.
+	OAuth21 OAuth21ResourceServerConfig `mapstructure:"oauth2_1"`
 }
 
 // LoggingConfig задаёт уровень диагностической и трассировочной телеметрии.
@@ -356,7 +410,16 @@ func DefaultConfig() Config {
 			MaxInputChars:       8000,
 			Deterministic:       false,
 		},
-		Auth: AuthConfig{UserAuthHeader: "X-User-Sub"},
+		Auth: AuthConfig{
+			UserAuthHeader: "X-User-Sub",
+			OAuth21: OAuth21ResourceServerConfig{
+				Enabled:      false,
+				AllowedAlgs:  []string{"RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "EdDSA"},
+				ClockSkewSec: 60,
+				SubjectClaim: "sub",
+				ScopeClaim:   "scope",
+			},
+		},
 		Logging: LoggingConfig{
 			Debug:                  false,
 			VerboseTracing:         false,
@@ -655,6 +718,32 @@ func applyEnv(cfg *Config) error {
 	}
 
 	cfg.Auth.UserAuthHeader = helpers.EnvString("AGENT_CORE_AUTH_USER_AUTH_HEADER", cfg.Auth.UserAuthHeader)
+	if v, ok, err := helpers.EnvBool("AGENT_CORE_AUTH_OAUTH2_1_ENABLED"); err != nil {
+		return err
+	} else if ok {
+		cfg.Auth.OAuth21.Enabled = v
+	}
+	cfg.Auth.OAuth21.IssuerURL = helpers.EnvString("AGENT_CORE_AUTH_OAUTH2_1_ISSUER_URL", cfg.Auth.OAuth21.IssuerURL)
+	cfg.Auth.OAuth21.JWKSURL = helpers.EnvString("AGENT_CORE_AUTH_OAUTH2_1_JWKS_URL", cfg.Auth.OAuth21.JWKSURL)
+	cfg.Auth.OAuth21.Audience = helpers.EnvString("AGENT_CORE_AUTH_OAUTH2_1_AUDIENCE", cfg.Auth.OAuth21.Audience)
+	if v, ok := helpers.EnvCSV("AGENT_CORE_AUTH_OAUTH2_1_REQUIRED_SCOPES"); ok {
+		cfg.Auth.OAuth21.RequiredScopes = v
+	}
+	if v, ok := helpers.EnvCSV("AGENT_CORE_AUTH_OAUTH2_1_ALLOWED_ALGS"); ok {
+		cfg.Auth.OAuth21.AllowedAlgs = v
+	}
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_AUTH_OAUTH2_1_CLOCK_SKEW_SEC"); err != nil {
+		return err
+	} else if ok {
+		cfg.Auth.OAuth21.ClockSkewSec = v
+	}
+	cfg.Auth.OAuth21.SubjectClaim = helpers.EnvString("AGENT_CORE_AUTH_OAUTH2_1_SUBJECT_CLAIM", cfg.Auth.OAuth21.SubjectClaim)
+	cfg.Auth.OAuth21.ScopeClaim = helpers.EnvString("AGENT_CORE_AUTH_OAUTH2_1_SCOPE_CLAIM", cfg.Auth.OAuth21.ScopeClaim)
+	if v, ok, err := helpers.EnvBool("AGENT_CORE_AUTH_OAUTH2_1_ALLOW_INSECURE_HTTP"); err != nil {
+		return err
+	} else if ok {
+		cfg.Auth.OAuth21.AllowInsecureHTTP = v
+	}
 
 	if v, ok, err := helpers.EnvBool("AGENT_CORE_LOGGING_DEBUG"); err != nil {
 		return err
@@ -742,11 +831,22 @@ func overrideSecrets(cfg *Config) {
 	}
 	for i := range cfg.MCP.Servers {
 		if strings.TrimSpace(cfg.MCP.Servers[i].Token) != "" {
+			// explicit token has priority over fallback env.
+		} else {
+			// envName строится по имени сервера, чтобы выбрать токен вида `MCP_TOKEN_<SERVER>`.
+			envName := "MCP_TOKEN_" + strings.ToUpper(strings.ReplaceAll(cfg.MCP.Servers[i].Name, "-", "_"))
+			cfg.MCP.Servers[i].Token = strings.TrimSpace(os.Getenv(envName))
+		}
+		if !cfg.MCP.Servers[i].OAuth21.Enabled {
 			continue
 		}
-		// envName строится по имени сервера, чтобы выбрать токен вида `MCP_TOKEN_<SERVER>`.
-		envName := "MCP_TOKEN_" + strings.ToUpper(strings.ReplaceAll(cfg.MCP.Servers[i].Name, "-", "_"))
-		cfg.MCP.Servers[i].Token = strings.TrimSpace(os.Getenv(envName))
+		prefix := strings.ToUpper(strings.ReplaceAll(cfg.MCP.Servers[i].Name, "-", "_"))
+		if strings.TrimSpace(cfg.MCP.Servers[i].OAuth21.ClientSecret) == "" {
+			cfg.MCP.Servers[i].OAuth21.ClientSecret = strings.TrimSpace(os.Getenv("MCP_OAUTH_CLIENT_SECRET_" + prefix))
+		}
+		if strings.TrimSpace(cfg.MCP.Servers[i].OAuth21.ClientID) == "" {
+			cfg.MCP.Servers[i].OAuth21.ClientID = strings.TrimSpace(os.Getenv("MCP_OAUTH_CLIENT_ID_" + prefix))
+		}
 	}
 }
 
@@ -820,6 +920,29 @@ func applyDerivedDefaults(cfg *Config) {
 	}
 	if cfg.Agent.ToolErrorFallback == nil {
 		cfg.Agent.ToolErrorFallback = map[string]string{}
+	}
+	cfg.Auth.OAuth21.RequiredScopes = normalizeUniqueStrings(cfg.Auth.OAuth21.RequiredScopes)
+	cfg.Auth.OAuth21.AllowedAlgs = normalizeUniqueStrings(cfg.Auth.OAuth21.AllowedAlgs)
+	if len(cfg.Auth.OAuth21.AllowedAlgs) == 0 {
+		cfg.Auth.OAuth21.AllowedAlgs = []string{"RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "EdDSA"}
+	}
+	if cfg.Auth.OAuth21.ClockSkewSec <= 0 {
+		cfg.Auth.OAuth21.ClockSkewSec = 60
+	}
+	if strings.TrimSpace(cfg.Auth.OAuth21.SubjectClaim) == "" {
+		cfg.Auth.OAuth21.SubjectClaim = "sub"
+	}
+	if strings.TrimSpace(cfg.Auth.OAuth21.ScopeClaim) == "" {
+		cfg.Auth.OAuth21.ScopeClaim = "scope"
+	}
+	for i := range cfg.MCP.Servers {
+		cfg.MCP.Servers[i].OAuth21.Scopes = normalizeUniqueStrings(cfg.MCP.Servers[i].OAuth21.Scopes)
+		if strings.TrimSpace(cfg.MCP.Servers[i].OAuth21.AuthMethod) == "" {
+			cfg.MCP.Servers[i].OAuth21.AuthMethod = "client_secret_basic"
+		}
+		if cfg.MCP.Servers[i].OAuth21.ClockSkewSec <= 0 {
+			cfg.MCP.Servers[i].OAuth21.ClockSkewSec = 30
+		}
 	}
 	if cfg.Output.MaxChars <= 0 {
 		cfg.Output.MaxChars = 8000
@@ -946,6 +1069,69 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("AGENT_CORE_AGENT_MCP_ENRICHMENT_SOURCES[%d].args must be valid JSON", idx)
 		}
 	}
+	if cfg.Auth.OAuth21.Enabled {
+		if strings.TrimSpace(cfg.Auth.OAuth21.Audience) == "" {
+			return fmt.Errorf("AGENT_CORE_AUTH_OAUTH2_1_AUDIENCE is required when AGENT_CORE_AUTH_OAUTH2_1_ENABLED=true")
+		}
+		if strings.TrimSpace(cfg.Auth.OAuth21.IssuerURL) == "" && strings.TrimSpace(cfg.Auth.OAuth21.JWKSURL) == "" {
+			return fmt.Errorf("AGENT_CORE_AUTH_OAUTH2_1_ISSUER_URL or AGENT_CORE_AUTH_OAUTH2_1_JWKS_URL is required when AGENT_CORE_AUTH_OAUTH2_1_ENABLED=true")
+		}
+		if err := validateOAuthURL(cfg.Auth.OAuth21.IssuerURL, cfg.Auth.OAuth21.AllowInsecureHTTP, "AGENT_CORE_AUTH_OAUTH2_1_ISSUER_URL"); err != nil {
+			return err
+		}
+		if err := validateOAuthURL(cfg.Auth.OAuth21.JWKSURL, cfg.Auth.OAuth21.AllowInsecureHTTP, "AGENT_CORE_AUTH_OAUTH2_1_JWKS_URL"); err != nil {
+			return err
+		}
+		if len(cfg.Auth.OAuth21.AllowedAlgs) == 0 {
+			return fmt.Errorf("AGENT_CORE_AUTH_OAUTH2_1_ALLOWED_ALGS must contain at least one algorithm")
+		}
+	}
+	for idx, server := range cfg.MCP.Servers {
+		if strings.TrimSpace(server.Name) == "" {
+			return fmt.Errorf("AGENT_CORE_MCP_SERVERS[%d].name must be non-empty", idx)
+		}
+		if strings.TrimSpace(server.BaseURL) == "" {
+			return fmt.Errorf("AGENT_CORE_MCP_SERVERS[%d].base_url must be non-empty", idx)
+		}
+		if !server.OAuth21.Enabled {
+			continue
+		}
+		if strings.TrimSpace(server.Token) != "" {
+			return fmt.Errorf("AGENT_CORE_MCP_SERVERS[%d] cannot use both token and oauth2_1", idx)
+		}
+		if strings.TrimSpace(server.OAuth21.ClientID) == "" {
+			return fmt.Errorf("AGENT_CORE_MCP_SERVERS[%d].oauth2_1.client_id must be non-empty", idx)
+		}
+		authMethod := strings.ToLower(strings.TrimSpace(server.OAuth21.AuthMethod))
+		switch authMethod {
+		case "client_secret_basic", "client_secret_post", "none":
+		default:
+			return fmt.Errorf(
+				"AGENT_CORE_MCP_SERVERS[%d].oauth2_1.auth_method must be one of: client_secret_basic|client_secret_post|none",
+				idx,
+			)
+		}
+		if authMethod != "none" && strings.TrimSpace(server.OAuth21.ClientSecret) == "" {
+			return fmt.Errorf("AGENT_CORE_MCP_SERVERS[%d].oauth2_1.client_secret must be non-empty for auth_method=%s", idx, authMethod)
+		}
+		if strings.TrimSpace(server.OAuth21.IssuerURL) == "" && strings.TrimSpace(server.OAuth21.TokenURL) == "" {
+			return fmt.Errorf("AGENT_CORE_MCP_SERVERS[%d].oauth2_1 requires issuer_url or token_url", idx)
+		}
+		if err := validateOAuthURL(
+			server.OAuth21.IssuerURL,
+			server.OAuth21.AllowInsecureHTTP,
+			fmt.Sprintf("AGENT_CORE_MCP_SERVERS[%d].oauth2_1.issuer_url", idx),
+		); err != nil {
+			return err
+		}
+		if err := validateOAuthURL(
+			server.OAuth21.TokenURL,
+			server.OAuth21.AllowInsecureHTTP,
+			fmt.Sprintf("AGENT_CORE_MCP_SERVERS[%d].oauth2_1.token_url", idx),
+		); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -998,6 +1184,38 @@ func parseMCPServers(raw string) ([]MCPServerConfig, error) {
 					return nil, fmt.Errorf("invalid MCP enabled value %q: %w", value, err)
 				}
 				server.Enabled = enabled
+			case "oauth2_1_enabled", "oauth21_enabled", "oauth_enabled":
+				enabled, err := strconv.ParseBool(value)
+				if err != nil {
+					return nil, fmt.Errorf("invalid MCP oauth enabled value %q: %w", value, err)
+				}
+				server.OAuth21.Enabled = enabled
+			case "oauth2_1_issuer_url", "oauth21_issuer_url":
+				server.OAuth21.IssuerURL = value
+			case "oauth2_1_token_url", "oauth21_token_url":
+				server.OAuth21.TokenURL = value
+			case "oauth2_1_client_id", "oauth21_client_id":
+				server.OAuth21.ClientID = value
+			case "oauth2_1_client_secret", "oauth21_client_secret":
+				server.OAuth21.ClientSecret = value
+			case "oauth2_1_audience", "oauth21_audience":
+				server.OAuth21.Audience = value
+			case "oauth2_1_scopes", "oauth21_scopes":
+				server.OAuth21.Scopes = parseScopeList(value)
+			case "oauth2_1_auth_method", "oauth21_auth_method":
+				server.OAuth21.AuthMethod = value
+			case "oauth2_1_clock_skew_sec", "oauth21_clock_skew_sec":
+				skewSec, err := strconv.Atoi(value)
+				if err != nil {
+					return nil, fmt.Errorf("invalid MCP oauth clock_skew_sec value %q: %w", value, err)
+				}
+				server.OAuth21.ClockSkewSec = skewSec
+			case "oauth2_1_allow_insecure_http", "oauth21_allow_insecure_http":
+				allowInsecure, err := strconv.ParseBool(value)
+				if err != nil {
+					return nil, fmt.Errorf("invalid MCP oauth allow_insecure_http value %q: %w", value, err)
+				}
+				server.OAuth21.AllowInsecureHTTP = allowInsecure
 			default:
 				return nil, fmt.Errorf("unsupported MCP server key: %s", key)
 			}
@@ -1091,4 +1309,66 @@ func parseLangfuseModelPrices(raw string) (map[string]LangfuseModelPrice, error)
 		}
 	}
 	return normalized, nil
+}
+
+func parseScopeList(raw string) []string {
+	normalized := strings.NewReplacer("|", " ", ",", " ", ";", " ").Replace(strings.TrimSpace(raw))
+	return normalizeUniqueStrings(strings.Fields(normalized))
+}
+
+func normalizeUniqueStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func validateOAuthURL(raw string, allowInsecure bool, label string) error {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return fmt.Errorf("%s parse error: %w", label, err)
+	}
+	if strings.TrimSpace(parsed.Scheme) == "" || strings.TrimSpace(parsed.Host) == "" {
+		return fmt.Errorf("%s must include scheme and host", label)
+	}
+	if !strings.EqualFold(parsed.Scheme, "https") && !strings.EqualFold(parsed.Scheme, "http") {
+		return fmt.Errorf("%s scheme must be https or http", label)
+	}
+	if strings.EqualFold(parsed.Scheme, "http") && !allowInsecure && !isLocalhostHost(parsed.Host) {
+		return fmt.Errorf("%s must use https", label)
+	}
+	return nil
+}
+
+func isLocalhostHost(hostport string) bool {
+	host := strings.TrimSpace(hostport)
+	if value, _, err := net.SplitHostPort(hostport); err == nil {
+		host = value
+	}
+	host = strings.TrimSpace(host)
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

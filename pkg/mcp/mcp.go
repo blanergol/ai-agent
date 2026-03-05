@@ -35,12 +35,63 @@ type Client interface {
 	CallTool(ctx context.Context, name string, args json.RawMessage) (tools.ToolResult, error)
 }
 
+// BearerTokenSource предоставляет OAuth bearer-токен для исходящих запросов.
+type BearerTokenSource interface {
+	AccessToken(ctx context.Context) (string, error)
+}
+
+// Authenticator добавляет аутентификацию к исходящему HTTP-запросу MCP.
+type Authenticator interface {
+	Authorize(ctx context.Context, req *http.Request) error
+}
+
+// NewStaticBearerAuthenticator создаёт аутентификатор c фиксированным bearer-токеном.
+func NewStaticBearerAuthenticator(token string) Authenticator {
+	return &staticBearerAuthenticator{token: strings.TrimSpace(token)}
+}
+
+type staticBearerAuthenticator struct {
+	token string
+}
+
+func (a *staticBearerAuthenticator) Authorize(_ context.Context, req *http.Request) error {
+	if strings.TrimSpace(a.token) == "" {
+		return nil
+	}
+	req.Header.Set("Authorization", "Bearer "+a.token)
+	return nil
+}
+
+// NewOAuthBearerAuthenticator создаёт bearer-аутентификатор на базе OAuth token source.
+func NewOAuthBearerAuthenticator(source BearerTokenSource) Authenticator {
+	return &oauthBearerAuthenticator{source: source}
+}
+
+type oauthBearerAuthenticator struct {
+	source BearerTokenSource
+}
+
+func (a *oauthBearerAuthenticator) Authorize(ctx context.Context, req *http.Request) error {
+	if a.source == nil {
+		return apperrors.New(apperrors.CodeAuth, "oauth token source is not configured", false)
+	}
+	token, err := a.source.AccessToken(ctx)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(token) == "" {
+		return apperrors.New(apperrors.CodeAuth, "oauth access token is empty", false)
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
+	return nil
+}
+
 // HTTPClient реализует Client поверх HTTP-транспорта и retry-политики.
 type HTTPClient struct {
 	// baseURL хранит адрес MCP API без завершающего `/`.
 	baseURL string
-	// token используется для bearer-аутентификации к серверу.
-	token string
+	// auth задаёт стратегию аутентификации исходящих MCP-запросов.
+	auth Authenticator
 	// client выполняет HTTP-запросы с заданным тайм-аутом.
 	client *http.Client
 	// retryPolicy задаёт единую стратегию повторов для list/call операций.
@@ -58,12 +109,17 @@ func NewHTTPClient(baseURL, token string, timeout time.Duration) *HTTPClient {
 
 // NewHTTPClientWithPolicy создаёт MCP-клиент с явной политикой retry/backoff.
 func NewHTTPClientWithPolicy(baseURL, token string, timeout time.Duration, retryPolicy retry.Policy) *HTTPClient {
+	return NewHTTPClientWithAuthenticator(baseURL, NewStaticBearerAuthenticator(token), timeout, retryPolicy)
+}
+
+// NewHTTPClientWithAuthenticator создаёт MCP-клиент с произвольной стратегией аутентификации.
+func NewHTTPClientWithAuthenticator(baseURL string, auth Authenticator, timeout time.Duration, retryPolicy retry.Policy) *HTTPClient {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
 	return &HTTPClient{
 		baseURL:     strings.TrimRight(baseURL, "/"),
-		token:       token,
+		auth:        auth,
 		client:      &http.Client{Timeout: timeout},
 		retryPolicy: retryPolicy,
 	}
@@ -77,7 +133,9 @@ func (c *HTTPClient) ListTools(ctx context.Context) ([]RemoteTool, error) {
 		if err != nil {
 			return apperrors.Wrap(apperrors.CodeBadRequest, "build mcp list tools request", err, false)
 		}
-		c.setAuth(req)
+		if err := c.setAuth(callCtx, req); err != nil {
+			return err
+		}
 
 		resp, err := c.client.Do(req)
 		if err != nil {
@@ -115,7 +173,9 @@ func (c *HTTPClient) CallTool(ctx context.Context, name string, args json.RawMes
 			return apperrors.Wrap(apperrors.CodeBadRequest, "build mcp tool request", err, false)
 		}
 		req.Header.Set("Content-Type", "application/json")
-		c.setAuth(req)
+		if err := c.setAuth(callCtx, req); err != nil {
+			return err
+		}
 
 		resp, err := c.client.Do(req)
 		if err != nil {
@@ -138,12 +198,18 @@ func (c *HTTPClient) CallTool(ctx context.Context, name string, args json.RawMes
 	return out, nil
 }
 
-// setAuth добавляет bearer-токен, если он настроен.
-func (c *HTTPClient) setAuth(req *http.Request) {
-	if c.token == "" {
-		return
+// setAuth добавляет авторизацию к запросу, если она настроена.
+func (c *HTTPClient) setAuth(ctx context.Context, req *http.Request) error {
+	if c.auth == nil {
+		return nil
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	if err := c.auth.Authorize(ctx, req); err != nil {
+		if apperrors.CodeOf(err) != "" {
+			return err
+		}
+		return apperrors.Wrap(apperrors.CodeAuth, "authorize mcp request", err, false)
+	}
+	return nil
 }
 
 // classifyMCPHTTPStatus сопоставляет HTTP-статус MCP-сервера с типизированной ошибкой приложения.

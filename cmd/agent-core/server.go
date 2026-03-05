@@ -11,6 +11,7 @@ import (
 	"github.com/blanergol/agent-core/core"
 	"github.com/blanergol/agent-core/pkg/apperrors"
 	"github.com/blanergol/agent-core/pkg/jsonx"
+	"github.com/blanergol/agent-core/pkg/oauth21"
 	"github.com/blanergol/agent-core/pkg/redact"
 	"github.com/blanergol/agent-core/pkg/telemetry"
 )
@@ -20,10 +21,15 @@ type agentRunner interface {
 	Run(ctx context.Context, in core.RunInput) (core.RunResult, error)
 }
 
+type accessTokenVerifier interface {
+	Verify(ctx context.Context, authorizationHeader string) (oauth21.Principal, error)
+}
+
 type apiServer struct {
 	runner         agentRunner
 	logger         *slog.Logger
 	userAuthHeader string
+	oauthVerifier  accessTokenVerifier
 	firstOnly      bool
 	webUIEnabled   bool
 	handled        atomic.Bool
@@ -55,7 +61,14 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
-func newAPIServer(runner agentRunner, logger *slog.Logger, userAuthHeader string, firstOnly bool, webUIEnabled bool) *apiServer {
+func newAPIServer(
+	runner agentRunner,
+	logger *slog.Logger,
+	userAuthHeader string,
+	oauthVerifier accessTokenVerifier,
+	firstOnly bool,
+	webUIEnabled bool,
+) *apiServer {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -63,6 +76,7 @@ func newAPIServer(runner agentRunner, logger *slog.Logger, userAuthHeader string
 		runner:         runner,
 		logger:         logger,
 		userAuthHeader: userAuthHeader,
+		oauthVerifier:  oauthVerifier,
 		firstOnly:      firstOnly,
 		webUIEnabled:   webUIEnabled,
 	}
@@ -96,6 +110,15 @@ func (s *apiServer) handleRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "agent is not initialized")
 		return
 	}
+	var principal oauth21.Principal
+	if s.oauthVerifier != nil {
+		verified, err := s.oauthVerifier.Verify(r.Context(), r.Header.Get("Authorization"))
+		if err != nil {
+			writeAuthFailure(w, err)
+			return
+		}
+		principal = verified
+	}
 
 	var req runRequest
 	if err := decodeJSONBody(r, &req); err != nil {
@@ -107,7 +130,9 @@ func (s *apiServer) handleRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "input is required")
 		return
 	}
-	if req.UserSub == "" && s.userAuthHeader != "" {
+	if principal.Subject != "" {
+		req.UserSub = principal.Subject
+	} else if req.UserSub == "" && s.userAuthHeader != "" {
 		req.UserSub = strings.TrimSpace(r.Header.Get(s.userAuthHeader))
 	}
 	session := telemetry.EnsureSession(telemetry.SessionInfo{
@@ -174,6 +199,17 @@ func decodeJSONBody(r *http.Request, out any) error {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, errorResponse{Error: message})
+}
+
+func writeAuthFailure(w http.ResponseWriter, err error) {
+	status := apperrors.HTTPStatus(err)
+	switch status {
+	case http.StatusUnauthorized:
+		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+	case http.StatusForbidden:
+		w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope"`)
+	}
+	writeError(w, status, apperrors.UserMessage(err))
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/blanergol/agent-core/core"
+	"github.com/blanergol/agent-core/pkg/apperrors"
+	"github.com/blanergol/agent-core/pkg/oauth21"
 )
 
 type fakeRunner struct {
@@ -27,6 +29,20 @@ func (f *fakeRunner) Run(_ context.Context, in core.RunInput) (core.RunResult, e
 	return f.result, nil
 }
 
+type fakeVerifier struct {
+	principal oauth21.Principal
+	err       error
+	calls     int
+}
+
+func (f *fakeVerifier) Verify(_ context.Context, _ string) (oauth21.Principal, error) {
+	f.calls++
+	if f.err != nil {
+		return oauth21.Principal{}, f.err
+	}
+	return f.principal, nil
+}
+
 func TestAPIServerFirstOnly(t *testing.T) {
 	runner := &fakeRunner{result: core.RunResult{
 		FinalResponse: "ok",
@@ -40,7 +56,7 @@ func TestAPIServerFirstOnly(t *testing.T) {
 		MCPTools:    []string{"mcp.remote.lookup"},
 		Skills:      []string{"ops"},
 	}}
-	srv := newAPIServer(runner, nil, "", true, false)
+	srv := newAPIServer(runner, nil, "", nil, true, false)
 	h := srv.routes()
 
 	req1 := httptest.NewRequest(http.MethodPost, "/v1/agent/run", strings.NewReader(`{"input":"hello"}`))
@@ -80,7 +96,7 @@ func TestAPIServerFirstOnly(t *testing.T) {
 
 func TestAPIServerReadsUserSubHeader(t *testing.T) {
 	runner := &fakeRunner{result: core.RunResult{FinalResponse: "ok", StopReason: "planner_done"}}
-	srv := newAPIServer(runner, nil, "X-User-Sub", false, false)
+	srv := newAPIServer(runner, nil, "X-User-Sub", nil, false, false)
 	h := srv.routes()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/agent/run", strings.NewReader(`{"input":"hello"}`))
@@ -96,7 +112,7 @@ func TestAPIServerReadsUserSubHeader(t *testing.T) {
 }
 
 func TestAPIServerWebUIDisabled(t *testing.T) {
-	srv := newAPIServer(&fakeRunner{}, nil, "", false, false)
+	srv := newAPIServer(&fakeRunner{}, nil, "", nil, false, false)
 	h := srv.routes()
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -108,7 +124,7 @@ func TestAPIServerWebUIDisabled(t *testing.T) {
 }
 
 func TestAPIServerWebUIEnabled(t *testing.T) {
-	srv := newAPIServer(&fakeRunner{}, nil, "", false, true)
+	srv := newAPIServer(&fakeRunner{}, nil, "", nil, false, true)
 	h := srv.routes()
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -126,5 +142,47 @@ func TestAPIServerWebUIEnabled(t *testing.T) {
 	}
 	if !strings.Contains(body, "textarea") {
 		t.Fatalf("ui body missing textarea")
+	}
+}
+
+func TestAPIServerRejectsWhenOAuthVerificationFails(t *testing.T) {
+	runner := &fakeRunner{result: core.RunResult{FinalResponse: "ok", StopReason: "planner_done"}}
+	verifier := &fakeVerifier{err: apperrors.New(apperrors.CodeAuth, "missing bearer token", false)}
+	srv := newAPIServer(runner, nil, "X-User-Sub", verifier, false, false)
+	h := srv.routes()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/agent/run", strings.NewReader(`{"input":"hello"}`))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if got := w.Header().Get("WWW-Authenticate"); !strings.Contains(got, "invalid_token") {
+		t.Fatalf("WWW-Authenticate = %q", got)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0", runner.calls)
+	}
+	if verifier.calls != 1 {
+		t.Fatalf("verifier calls = %d, want 1", verifier.calls)
+	}
+}
+
+func TestAPIServerUsesOAuthSubject(t *testing.T) {
+	runner := &fakeRunner{result: core.RunResult{FinalResponse: "ok", StopReason: "planner_done"}}
+	verifier := &fakeVerifier{principal: oauth21.Principal{Subject: "oauth-user"}}
+	srv := newAPIServer(runner, nil, "X-User-Sub", verifier, false, false)
+	h := srv.routes()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/agent/run", strings.NewReader(`{"input":"hello","user_sub":"body-user"}`))
+	req.Header.Set("X-User-Sub", "header-user")
+	req.Header.Set("Authorization", "Bearer token")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if runner.lastSub != "oauth-user" {
+		t.Fatalf("user_sub = %s, want oauth-user", runner.lastSub)
 	}
 }

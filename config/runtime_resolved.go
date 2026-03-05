@@ -81,6 +81,7 @@ type ResolvedRuntimeConfig struct {
 	Skills         []string
 	EnabledBundle  bool
 	UserAuthHeader string
+	AuthOAuth21    OAuth21ResourceServerConfig
 	WebUIEnabled   bool
 }
 
@@ -223,6 +224,7 @@ func ResolveRuntime(overrides RuntimeOverrides) (ResolvedRuntimeConfig, error) {
 		Skills:         cloneStrings(cfg.Skills),
 		EnabledBundle:  cfg.Bundle.Enabled,
 		UserAuthHeader: cfg.Auth.UserAuthHeader,
+		AuthOAuth21:    cloneOAuth21ResourceServerConfig(cfg.Auth.OAuth21),
 		WebUIEnabled:   cfg.WebUI.Enabled,
 	}, nil
 }
@@ -282,9 +284,16 @@ func cloneMCPServers(values []MCPServerConfig) []MCPServerConfig {
 	}
 	out := make([]MCPServerConfig, 0, len(values))
 	for _, value := range values {
+		value.OAuth21.Scopes = cloneStrings(value.OAuth21.Scopes)
 		out = append(out, value)
 	}
 	return out
+}
+
+func cloneOAuth21ResourceServerConfig(value OAuth21ResourceServerConfig) OAuth21ResourceServerConfig {
+	value.RequiredScopes = cloneStrings(value.RequiredScopes)
+	value.AllowedAlgs = cloneStrings(value.AllowedAlgs)
+	return value
 }
 
 // cloneMCPEnrichmentSources returns a copy of deterministic MCP enrichment sources.

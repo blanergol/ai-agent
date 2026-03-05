@@ -146,7 +146,7 @@ func newServeCmd() *cobra.Command {
 			}
 			defer shutdownRuntime(rt.Logger, rt.Shutdown)
 
-			api := newAPIServer(rt.Runner, rt.Logger, rt.UserAuthHeader, firstOnly, rt.WebUIEnabled)
+			api := newAPIServer(rt.Runner, rt.Logger, rt.UserAuthHeader, rt.OAuthVerifier, firstOnly, rt.WebUIEnabled)
 			srv := &http.Server{
 				Addr:              addr,
 				Handler:           api.routes(),

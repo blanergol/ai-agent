@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/blanergol/agent-core/config"
 	"github.com/blanergol/agent-core/core"
@@ -14,6 +15,7 @@ import (
 	"github.com/blanergol/agent-core/pkg/llm"
 	"github.com/blanergol/agent-core/pkg/mcp"
 	"github.com/blanergol/agent-core/pkg/memory"
+	"github.com/blanergol/agent-core/pkg/oauth21"
 	"github.com/blanergol/agent-core/pkg/output"
 	"github.com/blanergol/agent-core/pkg/planner"
 	skillspkg "github.com/blanergol/agent-core/pkg/skills"
@@ -31,6 +33,7 @@ type Runtime struct {
 	Runner         core.AgentRuntime
 	Logger         *slog.Logger
 	UserAuthHeader string
+	OAuthVerifier  oauth21.AccessTokenVerifier
 	WebUIEnabled   bool
 	Shutdown       func(context.Context) error
 }
@@ -72,6 +75,26 @@ func BuildRuntime(ctx context.Context, overrides Overrides) (*Runtime, error) {
 	)
 
 	toolRegistryCfg := resolved.ToolRegistry
+	var oauthVerifier oauth21.AccessTokenVerifier
+	if resolved.AuthOAuth21.Enabled {
+		verifier, err := oauth21.NewVerifier(oauth21.VerifierConfig{
+			IssuerURL:         resolved.AuthOAuth21.IssuerURL,
+			JWKSURL:           resolved.AuthOAuth21.JWKSURL,
+			Audience:          resolved.AuthOAuth21.Audience,
+			RequiredScopes:    resolved.AuthOAuth21.RequiredScopes,
+			AllowedAlgs:       resolved.AuthOAuth21.AllowedAlgs,
+			ClockSkew:         time.Duration(resolved.AuthOAuth21.ClockSkewSec) * time.Second,
+			SubjectClaim:      resolved.AuthOAuth21.SubjectClaim,
+			ScopeClaim:        resolved.AuthOAuth21.ScopeClaim,
+			AllowInsecureHTTP: resolved.AuthOAuth21.AllowInsecureHTTP,
+			HTTPTimeout:       toolRegistryCfg.DefaultTimeout,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("init inbound oauth verifier: %w", err)
+		}
+		oauthVerifier = verifier
+	}
+
 	var bundle *internal.Bundle
 	if resolved.EnabledBundle {
 		bundle = internal.NewBundle()
@@ -114,11 +137,30 @@ func BuildRuntime(ctx context.Context, overrides Overrides) (*Runtime, error) {
 			if !server.Enabled {
 				continue
 			}
+			authenticator := mcp.NewStaticBearerAuthenticator(server.Token)
+			if server.OAuth21.Enabled {
+				tokenSource, err := oauth21.NewClientCredentialsTokenSource(oauth21.ClientCredentialsConfig{
+					IssuerURL:         server.OAuth21.IssuerURL,
+					TokenURL:          server.OAuth21.TokenURL,
+					ClientID:          server.OAuth21.ClientID,
+					ClientSecret:      server.OAuth21.ClientSecret,
+					Audience:          server.OAuth21.Audience,
+					Scopes:            server.OAuth21.Scopes,
+					AuthMethod:        server.OAuth21.AuthMethod,
+					ClockSkew:         time.Duration(server.OAuth21.ClockSkewSec) * time.Second,
+					AllowInsecureHTTP: server.OAuth21.AllowInsecureHTTP,
+					HTTPTimeout:       toolRegistryCfg.DefaultTimeout,
+				})
+				if err != nil {
+					return nil, fmt.Errorf("init mcp oauth for %s: %w", server.Name, err)
+				}
+				authenticator = mcp.NewOAuthBearerAuthenticator(tokenSource)
+			}
 			bridge := mcp.Bridge{
 				ServerName: server.Name,
-				Client: mcp.NewHTTPClientWithPolicy(
+				Client: mcp.NewHTTPClientWithAuthenticator(
 					server.BaseURL,
-					server.Token,
+					authenticator,
 					toolRegistryCfg.DefaultTimeout,
 					resolved.ToolRetryPolicy,
 				),
@@ -214,6 +256,7 @@ func BuildRuntime(ctx context.Context, overrides Overrides) (*Runtime, error) {
 		Runner:         runtime,
 		Logger:         logger,
 		UserAuthHeader: resolved.UserAuthHeader,
+		OAuthVerifier:  oauthVerifier,
 		WebUIEnabled:   resolved.WebUIEnabled,
 		Shutdown:       shutdown,
 	}, nil
