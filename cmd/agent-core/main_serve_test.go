@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/blanergol/agent-core/internal/telemetry"
+	"github.com/blanergol/agent-core/pkg/telemetry"
 )
 
 // TestRunHTTPServerStopsOnContextCancel проверяет путь graceful shutdown при отмене serve-контекста (SIGINT/SIGTERM).

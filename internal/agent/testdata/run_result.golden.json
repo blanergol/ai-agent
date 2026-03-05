@@ -1,9 +1,0 @@
-{
-  "api_version": "v1",
-  "session_id": "session-000001",
-  "correlation_id": "corr-000001",
-  "final_response": "done",
-  "steps": 1,
-  "tool_calls": 0,
-  "stop_reason": "planner_done"
-}

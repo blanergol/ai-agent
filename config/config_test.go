@@ -1,6 +1,11 @@
 package config
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/blanergol/agent-core/core"
+)
 
 // TestLoadFromEnvOverridesValues проверяет, что переменные окружения корректно переопределяют дефолты.
 func TestLoadFromEnvOverridesValues(t *testing.T) {
@@ -107,6 +112,34 @@ func TestLoadParsesDeterministicEnvOverrides(t *testing.T) {
 	}
 	if !cfg.LLM.DisableJitter {
 		t.Fatalf("llm disable_jitter = %t, want true", cfg.LLM.DisableJitter)
+	}
+}
+
+func TestLoadParsesMCPEnrichmentSources(t *testing.T) {
+	t.Setenv("AGENT_CORE_MODE", "test")
+	t.Setenv(
+		"AGENT_CORE_AGENT_MCP_ENRICHMENT_SOURCES",
+		`[{"name":"kb","tool_name":"mcp.docs.search","args":{"query":"agent"},"required":true}]`,
+	)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load error: %v", err)
+	}
+	if len(cfg.Agent.MCPEnrichmentSources) != 1 {
+		t.Fatalf("sources len = %d, want 1", len(cfg.Agent.MCPEnrichmentSources))
+	}
+	src := cfg.Agent.MCPEnrichmentSources[0]
+	if src.Name != "kb" {
+		t.Fatalf("name = %s, want kb", src.Name)
+	}
+	if src.ToolName != "mcp.docs.search" {
+		t.Fatalf("tool_name = %s", src.ToolName)
+	}
+	if !src.Required {
+		t.Fatalf("required = %t, want true", src.Required)
+	}
+	if !json.Valid(src.Args) {
+		t.Fatalf("args are not valid json: %s", string(src.Args))
 	}
 }
 
@@ -217,5 +250,109 @@ func TestLoadRejectsNegativeLangfuseModelPrices(t *testing.T) {
 	)
 	if _, err := Load(); err == nil {
 		t.Fatalf("expected validation error for negative model pricing")
+	}
+}
+
+// TestResolveRuntimeAppliesOverrides проверяет применение CLI overrides при подготовке runtime-конфига.
+func TestResolveRuntimeAppliesOverrides(t *testing.T) {
+	t.Setenv("AGENT_CORE_MODE", "test")
+	debug := true
+
+	resolved, err := ResolveRuntime(RuntimeOverrides{
+		Provider: "ollama",
+		Model:    "llama3",
+		Debug:    &debug,
+	})
+	if err != nil {
+		t.Fatalf("resolve runtime error: %v", err)
+	}
+	if resolved.LLM.Provider != "ollama" {
+		t.Fatalf("provider = %s, want ollama", resolved.LLM.Provider)
+	}
+	if resolved.LLM.Model != "llama3" {
+		t.Fatalf("model = %s, want llama3", resolved.LLM.Model)
+	}
+	if !resolved.LoggerDebug {
+		t.Fatalf("logger debug = %t, want true", resolved.LoggerDebug)
+	}
+	if resolved.ToolRegistry.DefaultTimeout <= 0 {
+		t.Fatalf("tool default timeout = %s, want > 0", resolved.ToolRegistry.DefaultTimeout)
+	}
+}
+
+// TestResolveRuntimeBuildsTypedToolErrorPolicy проверяет преобразование строкового tool error режима в typed core mode.
+func TestResolveRuntimeBuildsTypedToolErrorPolicy(t *testing.T) {
+	t.Setenv("AGENT_CORE_MODE", "test")
+	t.Setenv("AGENT_CORE_AGENT_TOOL_ERROR_MODE", "fail")
+	t.Setenv("AGENT_CORE_AGENT_TOOL_ERROR_FALLBACK", "http.get=continue")
+
+	resolved, err := ResolveRuntime(RuntimeOverrides{})
+	if err != nil {
+		t.Fatalf("resolve runtime error: %v", err)
+	}
+	if resolved.ToolErrorDefaultMode != core.ToolErrorModeFail {
+		t.Fatalf("default tool error mode = %s, want %s", resolved.ToolErrorDefaultMode, core.ToolErrorModeFail)
+	}
+	if resolved.ToolErrorFallback["http.get"] != core.ToolErrorModeContinue {
+		t.Fatalf(
+			"tool_error_fallback[http.get] = %s, want %s",
+			resolved.ToolErrorFallback["http.get"],
+			core.ToolErrorModeContinue,
+		)
+	}
+}
+
+func TestResolveRuntimeMapsMCPEnrichmentSources(t *testing.T) {
+	t.Setenv("AGENT_CORE_MODE", "test")
+	t.Setenv(
+		"AGENT_CORE_AGENT_MCP_ENRICHMENT_SOURCES",
+		`[{"name":"kb","tool_name":"mcp.docs.search","args":{"query":"agent"},"required":true}]`,
+	)
+	resolved, err := ResolveRuntime(RuntimeOverrides{})
+	if err != nil {
+		t.Fatalf("resolve runtime error: %v", err)
+	}
+	if len(resolved.MCPEnrichmentSources) != 1 {
+		t.Fatalf("sources len = %d, want 1", len(resolved.MCPEnrichmentSources))
+	}
+	if resolved.MCPEnrichmentSources[0].ToolName != "mcp.docs.search" {
+		t.Fatalf("tool_name = %s", resolved.MCPEnrichmentSources[0].ToolName)
+	}
+	if !resolved.MCPEnrichmentSources[0].Required {
+		t.Fatalf("required = %t, want true", resolved.MCPEnrichmentSources[0].Required)
+	}
+}
+
+// TestResolveRuntimeRejectsInvalidProviderOverride проверяет валидацию неподдерживаемого provider override.
+func TestResolveRuntimeRejectsInvalidProviderOverride(t *testing.T) {
+	t.Setenv("AGENT_CORE_MODE", "test")
+	if _, err := ResolveRuntime(RuntimeOverrides{Provider: "invalid-provider"}); err == nil {
+		t.Fatalf("expected invalid provider override error")
+	}
+}
+
+func TestLoadParsesBundleEnabled(t *testing.T) {
+	t.Setenv("AGENT_CORE_MODE", "test")
+	t.Setenv("AGENT_CORE_BUNDLE_ENABLED", "true")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load error: %v", err)
+	}
+	if !cfg.Bundle.Enabled {
+		t.Fatalf("bundle.enabled = %t, want true", cfg.Bundle.Enabled)
+	}
+}
+
+func TestResolveRuntimeMapsBundlenabled(t *testing.T) {
+	t.Setenv("AGENT_CORE_MODE", "test")
+	t.Setenv("AGENT_CORE_BUNDLE_ENABLED", "true")
+
+	resolved, err := ResolveRuntime(RuntimeOverrides{})
+	if err != nil {
+		t.Fatalf("resolve runtime error: %v", err)
+	}
+	if !resolved.EnabledBundle {
+		t.Fatalf("bundle_enabled = %t, want true", resolved.EnabledBundle)
 	}
 }

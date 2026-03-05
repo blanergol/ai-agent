@@ -6,7 +6,7 @@
 
 Проект уже содержит:
 
-- исполняемое ядро агента с циклом `observe -> plan -> act -> reflect -> stop`;
+- исполняемое ядро агента с циклом `observe -> enrich_context -> plan -> act -> reflect -> stop`;
 - строгий JSON-планировщик действий (`tool | final | noop`);
 - реестр инструментов с политиками безопасности, retry/backoff, кэшированием и дедупликацией;
 - управление памятью (short-term + long-term), state/snapshot, guardrails;
@@ -175,127 +175,95 @@ curl -X POST http://localhost:8080/v1/agent/run \
 
 ## 4) Архитектура исполнения
 
-### Высокоуровневый поток
+### Pipeline loop (текущая реализация)
 
-1. Вход (`CLI`/`HTTP`) -> `RunInput`.
-2. Создается/восстанавливается сессионный контекст (`session_id`, `correlation_id`).
-3. `memory.BuildContext()` формирует наблюдение для планировщика.
-4. `planner.Plan()` возвращает JSON-действие.
-5. `guardrails.ValidateAction()` проверяет безопасность.
-6. `agent.act()` выполняет `tool` или завершает `final`.
-7. Результаты шага пишутся в память/state/telemetry.
-8. Финальный ответ валидируется (`output policy + optional json schema`).
-9. Возвращается `RunResult` (`api_version=v1`) и сохраняется runtime snapshot.
+Порядок stage по умолчанию:
+
+1. `observe`
+2. `enrich_context`
+3. `plan`
+4. `act`
+5. `reflect`
+6. `stop`
+
+Этот stage-loop по-прежнему исполняется в `core.Runtime.Run()` и **не** заменяется пользовательской бизнес-логикой.
+
+### Детерминированные фазы внутри цикла
+
+Каждый stage использует явные фазы и `RunContext.ExecutePhase(...)`:
+
+- `INPUT` (вход в runtime)
+- `NORMALIZE` (`sanitize` stage, если включен)
+- `GUARDRAILS` (точки валидации в `observe` и `act`)
+- `ENRICH_CONTEXT` (`enrich_context` stage)
+- `DECIDE_ACTION` (`plan` stage, LLM planner)
+- `BEFORE_TOOL_EXECUTION` (`act`, перед вызовом tool)
+- `TOOL_EXECUTION` (`act`, вызов через `ToolExecutor`)
+- `AFTER_TOOL_EXECUTION` (`act`, после вызова tool)
+- `EVALUATE` (`reflect`)
+- `STOP_CHECK` (`reflect`)
+- `FINALIZE` (`stop`)
+
+Так появляются детерминированные точки вмешательства без изменения семантики базового цикла.
+
+### Модель State, общая для всех фаз
+
+`RunContext.State` (`core.AgentState`) хранит централизованное состояние запуска/итерации:
+
+- `raw_input`, `normalized_input`
+- результаты guardrails (счетчики/нарушения)
+- детерминированные payload-обогащения в `context`
+- `retrieved_docs`
+- snapshot памяти для планировщика
+- `tool_calls_history` и `tool_results`
+- `errors`
+- `budgets` (token/time/cost поля)
+- trace/debug данные (`phase` traces + iteration metrics)
+- `iteration` counter
+
+### Как управляется цикл
+
+Базовый runtime-loop не меняется и управляется кодом возврата stage:
+
+- `StageControlContinue` -> перейти к следующему stage/итерации
+- `StageControlRetry` -> повторить цикл с optional backoff
+- `StageControlStop` -> собрать `RunResult` и завершить
 
 ### Stop conditions
 
-Цикл завершится при одном из условий:
+Цикл завершается при одном из условий:
 
-- `planner` вернул `final` или `done=true`;
-- guardrails достигли лимита (`steps/time/tool_calls/output_size`);
-- обнаружено повторение одного и того же действия > 3 раз (`repeated_action_detected`);
-- не удалось восстановиться после ошибок планировщика/инструментов/валидации.
+- planner вернул `final` или `done=true`;
+- guardrails достигли лимитов (`steps/time/tool_calls/output_size`);
+- одно и то же эффективное действие повторилось более 3 раз (`repeated_action_detected`);
+- исчерпаны recovery retries планировщика/инструментов/валидации.
 
 ---
 
 ## 5) Карта кодовой базы
 
-### Точка входа
+### Слоистая структура
 
-- `cmd/agent-core/main.go`
-  - сборка runtime зависимостей;
-  - CLI команды `run` и `serve`;
-  - wiring: `config -> llm -> memory -> tools -> skills -> mcp -> planner -> guardrails -> agent`.
-- `cmd/agent-core/server.go`
-  - HTTP API (`/healthz`, `/v1/agent/run`) и регистрация Web UI роутов;
-  - JSON decoding c ограничением размера и `DisallowUnknownFields`.
-- `cmd/agent-core/webui.go`
-  - одностраничный встроенный интерфейс для теста агента;
-  - отправка запросов в `/v1/agent/run` напрямую из браузера.
-
-### Конфигурация
-
-- `config/config.go`
-  - типизированный `Config` + `DefaultConfig()`;
-  - загрузка env, derived defaults, валидация;
-  - парсинг `AGENT_CORE_MCP_SERVERS` и `AGENT_CORE_AGENT_TOOL_ERROR_FALLBACK`.
-
-### Агент и runtime контракты
-
-- `internal/agent/agent.go`
-  - основной цикл, retries планировщика, tool error policy, output validation.
-- `internal/agent/events.go`
-  - наблюдаемые события (`run_started`, `step_planned`, `tool_failed`, ...).
-- `internal/agent/snapshot.go`, `kv_snapshot_store.go`
-  - контракт `SnapshotStore` и реализация поверх `state.Store`.
-- `internal/agent/contract_notes.go`
-  - журнал изменений публичного контракта `v1`.
-
-### Планировщик
-
-- `internal/planner/planner.go`
-  - строгая JSON-схема action;
-  - `ChatJSON` + semantically validate + policy validate + retries.
-- `internal/planner/tool_policy.go`
-  - policy выбора инструментов из текущего каталога.
-
-### Инструменты
-
-- `internal/tools/registry.go`
-  - allowlist/denylist;
-  - timeout + concurrency limiter;
-  - retry/backoff;
-  - дедуп mutating-вызовов;
-  - read-cache (локальный + shared backplane);
-  - валидация input/output JSON schema.
-- `internal/tools/kv.go`, `time_now.go`, `http_get.go`
-  - базовые встроенные инструменты.
-
-### LLM слой
-
-- `internal/llm/factory.go`
-  - выбор провайдера (`openai`, `openrouter`, `ollama`, `lmstudio`).
-- `internal/llm/langchain_provider.go`
-  - вызовы модели через `langchaingo`;
-  - circuit breaker, retry/backoff, cache, stream;
-  - token-usage metrics (`provider_native` или `estimated`).
-
-### Память, state, guardrails
-
-- `internal/memory/memory.go`
-  - short-term window + long-term recall;
-  - token budget trimming;
-  - write policy + redaction.
-- `internal/state/store.go`, `session_scope.go`
-  - thread-safe KV, atomic file persistence, session namespace.
-- `internal/guardrails/guardrails.go`
-  - лимиты шагов, времени, tool calls, tool output bytes.
-
-### Безопасность и валидация выхода
-
-- `internal/output/*`
-  - policy validator + schema validator + compose.
-- `internal/redact/redact.go`
-  - маскирование ключей, bearer/JWT, email, private keys.
-- `internal/apperrors/errors.go`
-  - типизированные ошибки и HTTP mapping.
-
-### Интеграции и расширяемость
-
-- `internal/skills/*`
-  - skill registry, встроенный `ops` skill.
-- `internal/mcp/mcp.go`
-  - импорт удаленных MCP tools как `mcp.<server>.<tool>`.
-- `internal/cache/backplane.go`
-  - `InMemoryBackplane` и `FileBackplane` для shared cache.
-
-### Телеметрия
-
-- `internal/telemetry/*`
-  - session/correlation context;
-  - context-aware logger;
-  - tracer/metrics interfaces;
-  - debug artifacts sink.
+- `core/`
+  - контракты каркаса и оркестратор (`RunInput/RunResult`, `Action`, `Stage`, `Pipeline`, `Runtime`);
+  - детерминированная фазовая модель (`Phase`), централизованный state (`AgentState`), interceptors, абстракция tool-executor;
+  - API композиции stage (`InsertBefore/After`, `Replace`, `Remove`, hooks, middleware);
+  - stop/retry модель для stage.
+- `pkg/`
+  - переиспользуемые библиотеки без зависимости на `internal`/`cmd`:
+  - `pkg/apperrors`, `pkg/redact`, `pkg/retry`, `pkg/cache`, `pkg/jsonx`, `pkg/state`, `pkg/llm`, `pkg/telemetry`;
+  - runtime-реализации ядра: `pkg/planner`, `pkg/memory`, `pkg/guardrails`, `pkg/output`, `pkg/tools`, `pkg/mcp`, `pkg/stages`, `pkg/skills`.
+- `internal/`
+  - project-private domain code (business adapters/tools/policies that should not be exported).
+  - this repository includes a real incident-response bundle under `internal/*` (tools, skill, pipeline mutations, interceptors).
+- `cmd/`
+  - транспорты и точки входа:
+  - `cmd/agent-core/main.go`: сборка runtime и запуск `run`/`serve`;
+  - `cmd/agent-core/runtime.go`: wiring зависимостей (`LLM`, `memory`, `planner`, `tool registry`, `interceptors`, `pipeline`);
+  - `cmd/agent-core/server.go`: HTTP API (`/healthz`, `/v1/agent/run`) + optional Web UI.
+- `config/`
+  - типизированный `Config`, env parsing, валидация и derived defaults;
+  - разбор `AGENT_CORE_MCP_SERVERS`, `AGENT_CORE_AGENT_TOOL_ERROR_FALLBACK`, `AGENT_CORE_AGENT_MCP_ENRICHMENT_SOURCES`.
 
 ---
 
@@ -324,13 +292,54 @@ curl -X POST http://localhost:8080/v1/agent/run \
 
 ### Skills
 
-Сейчас в коде есть:
+Built-in reusable skill:
 
-- `ops` (`internal/skills/ops.go`)
-  - регистрирует `time.now` и `http.get`;
-  - добавляет prompt hint для планировщика.
+- `ops` (`pkg/skills/ops.go`)
+  - registers `time.now` and `http.get`;
+  - adds planner prompt hint.
 
-Активные skills задаются через `AGENT_CORE_SKILLS` (CSV).
+Optional internal skill (available when bundle is enabled):
+
+- `incident_ops` (`internal/skills/incident_ops_skill.go`)
+  - guidance-only skill (does not register tools by itself);
+  - adds deterministic incident workflow hints for planner behavior.
+
+Active skills are configured via `AGENT_CORE_SKILLS` (CSV).
+When `AGENT_CORE_BUNDLE_ENABLED=true`, add `incident_ops` explicitly (for example `AGENT_CORE_SKILLS=ops,incident_ops`) if you want the internal skill guidance.
+
+### Расширения бизнес-pipeline
+
+Есть 3 уровня расширения, от простого к строгому:
+
+1. Stage-level (`pkg/stages` + `stages.PipelineMutation`)
+- изменить порядок stage или добавить custom stage (`InsertBefore/After`, `Replace`, `Remove`, `Append`).
+
+2. Phase-level (`core.InterceptorRegistry`)
+- регистрировать детерминированную логику до/после любой фазы через `RegisterInterceptor(phase, interceptor)`.
+- лучший уровень для policy enforcement, context injection, fallback-логики и корректировки stop conditions.
+
+3. Tool-level (`core.ToolExecutor` + tool interceptors)
+- пропускать каждый вызов инструмента через единый executor.
+- можно блокировать/переписывать вызовы, добавлять детерминированные retries/fallback, трассировку и routing по политике.
+
+Минимальный шаблон регистрации:
+
+```go
+interceptors := core.NewInterceptorRegistry()
+interceptors.RegisterInterceptor(core.PhaseEnrichContext, myInterceptor)
+interceptors.RegisterToolInterceptor(myToolInterceptor)
+
+toolExecutor := core.NewRegistryToolExecutor(toolRegistry, interceptors)
+
+runtime := core.NewRuntime(cfg, core.RuntimeDeps{
+    // ...
+    Tools:        toolRegistry,
+    ToolExecutor: toolExecutor,
+    Interceptors: interceptors,
+}, pipeline)
+```
+
+Детерминированный пример по умолчанию: `core.MCPContextEnrichment`, выполняется в `ENRICH_CONTEXT` до решения планировщика.
 
 ---
 
@@ -409,6 +418,18 @@ curl -X POST http://localhost:8080/v1/agent/run \
     name=local,base_url=http://localhost:8787,enabled=true
     ```
 - secret fallback: `MCP_TOKEN_<SERVER_NAME>`
+- детерминированное pre-plan enrichment:
+  - `AGENT_CORE_AGENT_MCP_ENRICHMENT_SOURCES` (JSON array), пример:
+    ```json
+    [
+      {
+        "name": "kb",
+        "tool_name": "mcp.docs.search",
+        "args": {"query": "current user task"},
+        "required": true
+      }
+    ]
+    ```
 
 ### State
 
@@ -428,6 +449,8 @@ curl -X POST http://localhost:8080/v1/agent/run \
   - CSV: `http.get=continue,crm.write=fail`
 - `AGENT_CORE_AGENT_MAX_INPUT_CHARS`
 - `AGENT_CORE_AGENT_DETERMINISTIC`
+- `AGENT_CORE_BUNDLE_ENABLED` (enable internal incident-response bundle in `internal/*`)
+- `AGENT_CORE_AGENT_MCP_ENRICHMENT_SOURCES` (JSON array для детерминированных MCP вызовов в `ENRICH_CONTEXT`)
 - `AGENT_CORE_GUARDRAILS_MAX_STEPS`
 - `AGENT_CORE_GUARDRAILS_MAX_TOOL_CALLS`
 - `AGENT_CORE_GUARDRAILS_MAX_TIME_MS`
@@ -478,7 +501,7 @@ curl -X POST http://localhost:8080/v1/agent/run \
 
 ### Память
 
-`internal/memory` использует 2 слоя:
+`pkg/memory` использует 2 слоя:
 
 1. short-term (`[]llm.Message`)
 - окно последних сообщений;
@@ -497,7 +520,7 @@ curl -X POST http://localhost:8080/v1/agent/run \
 
 ### State
 
-`internal/state/KVStore`:
+`pkg/state/KVStore`:
 
 - потокобезопасный KV;
 - атомарная запись в файл;
@@ -505,9 +528,14 @@ curl -X POST http://localhost:8080/v1/agent/run \
 - helpers с context (`PutWithContext`, `GetWithContext`, ...);
 - keys namespaced по сессии через `state.NamespacedKey`.
 
+Snapshots:
+
+- runtime snapshots persist short-term memory context;
+- guardrail counters are reset for each new run and are not restored from previous requests.
+
 ### Cache backplane
 
-`internal/cache` позволяет шарить кэш между инстансами процесса:
+`pkg/cache` позволяет шарить кэш между инстансами процесса:
 
 - `InMemoryBackplane` — process-local;
 - `FileBackplane` — общий file-backed.
@@ -597,55 +625,137 @@ Langfuse correlation mapping (через OTLP attributes):
 
 ## 11) Расширение каркаса
 
-### 11.1 Добавление нового инструмента
+### 11.1 Управление pipeline-циклом без переписывания loop
 
-Шаги:
+Поведение можно безопасно контролировать на трех уровнях:
 
-1. Реализовать интерфейс `tools.Tool`.
-2. (Опционально) реализовать `RetryPolicy` и `CachePolicy`.
-3. Зарегистрировать tool в `buildRuntime` или внутри skill.
-4. Добавить имя инструмента в `AGENT_CORE_TOOLS_ALLOWLIST`.
+1. Stage-level (`stages.PipelineMutation`)
+- менять порядок/состав stage (reorder/insert/replace/remove).
 
-Пример:
+2. Phase-level (`core.InterceptorRegistry`)
+- добавлять детерминированную бизнес-логику до/после фазы (`INPUT`, `ENRICH_CONTEXT`, `STOP_CHECK` и т.д.).
+
+3. Tool-level (`ToolExecutionInterceptor`)
+- блокировать/переписывать/fallback-ить tool calls в одном централизованном месте.
+
+### 11.2 Stage-level контроль (мутации pipeline)
 
 ```go
-type CRMGetCustomerTool struct {
-    client *crm.Client
-}
+pipeline, err := stages.BuildDefaultPipeline(
+    stages.FactoryConfig{},
+    stages.InsertBefore("plan", myBusinessStage{}),
+    stages.InsertAfter("reflect", myAuditStage{}),
+)
+```
 
-func (t *CRMGetCustomerTool) Name() string { return "crm.get_customer" }
-func (t *CRMGetCustomerTool) Description() string { return "Reads customer profile by id" }
-func (t *CRMGetCustomerTool) InputSchema() string {
-    return `{"type":"object","required":["customer_id"],"properties":{"customer_id":{"type":"string","minLength":1}},"additionalProperties":false}`
-}
-func (t *CRMGetCustomerTool) OutputSchema() string {
-    return `{"type":"object","required":["customer_id","tier","status"],"properties":{"customer_id":{"type":"string"},"tier":{"type":"string"},"status":{"type":"string"}},"additionalProperties":true}`
-}
-func (t *CRMGetCustomerTool) IsReadOnly() bool  { return true }
-func (t *CRMGetCustomerTool) IsSafeRetry() bool { return true }
+Используйте stage-mutations, когда нужна явная структурная правка порядка stage.
 
-func (t *CRMGetCustomerTool) Execute(ctx context.Context, args json.RawMessage) (tools.ToolResult, error) {
-    var in struct {
-        CustomerID string `json:"customer_id"`
+### 11.3 Phase-level контроль (детерминированная бизнес-логика)
+
+```go
+type PolicyInterceptor struct{}
+
+func (PolicyInterceptor) Name() string { return "policy" }
+func (PolicyInterceptor) BeforePhase(ctx context.Context, run *core.RunContext, phase core.Phase) error {
+    if phase == core.PhaseStopCheck && shouldForceStop(run) {
+        run.PendingStop = true
+        run.PendingStopReason = "business_policy_stop"
     }
-    if err := json.Unmarshal(args, &in); err != nil {
-        return tools.ToolResult{}, err
+    return nil
+}
+func (PolicyInterceptor) AfterPhase(context.Context, *core.RunContext, core.Phase, error) error { return nil }
+
+interceptors := core.NewInterceptorRegistry()
+interceptors.RegisterInterceptor(core.PhaseEnrichContext, PolicyInterceptor{})
+```
+
+Phase-interceptors подходят для:
+
+- детерминированного enrichment контекста;
+- override stop conditions;
+- policy checks до решения LLM;
+- переписывания state между итерациями.
+
+### 11.4 Централизованный контроль исполнения tools
+
+`ToolExecutor` - единый gateway выполнения. Базовая реализация делегирует в `pkg/tools.Registry` (allow/deny policy, schema validation, timeout, retries, cache, dedup, logging) и дополнительно поддерживает around-execution interceptors.
+
+```go
+type BlockDangerousWrites struct{}
+
+func (BlockDangerousWrites) Name() string { return "block_writes" }
+func (BlockDangerousWrites) AroundToolExecution(
+    ctx context.Context,
+    run *core.RunContext,
+    call core.ToolCall,
+    next core.ToolExecutionFunc,
+) (core.ToolResult, error) {
+    if call.Name == "crm.delete_customer" {
+        return core.ToolResult{}, fmt.Errorf("tool blocked by business policy")
     }
-    profile, err := t.client.GetCustomer(ctx, in.CustomerID)
-    if err != nil {
-        return tools.ToolResult{}, err
-    }
-    raw, err := json.Marshal(profile)
-    if err != nil {
-        return tools.ToolResult{}, err
-    }
-    return tools.ToolResult{Output: string(raw)}, nil
+    return next(ctx, run, call)
 }
 ```
 
-### 11.2 Добавление нового skill
+### 11.5 Детерминированный MCP enrichment до решения planner
 
-`skill` = пакет инструментов + prompt additions.
+Встроенный пример: `core.MCPContextEnrichment` работает в фазе `ENRICH_CONTEXT` и добавляет результаты в `RunContext.State.Context`.
+
+Wiring в runtime:
+
+```go
+interceptors := core.NewInterceptorRegistry()
+interceptors.RegisterInterceptor(
+    core.PhaseEnrichContext,
+    core.NewMCPContextEnrichment(resolved.MCPEnrichmentSources),
+)
+toolExecutor := core.NewRegistryToolExecutor(toolRegistry, interceptors)
+```
+
+Конфигурация:
+
+- `AGENT_CORE_AGENT_MCP_ENRICHMENT_SOURCES` (JSON array)
+- формат элемента: `name`, `tool_name`, `args`, `required`
+
+### 11.6 Добавить переиспользуемый tool в `pkg/tools` (shared library)
+
+Шаги:
+
+1. Реализовать `tools.Tool`.
+2. (Опционально) реализовать `RetryPolicy` и `CachePolicy`.
+3. Зарегистрировать инструмент в runtime wiring или внутри skill.
+4. Добавить имя в `AGENT_CORE_TOOLS_ALLOWLIST`.
+
+### 11.7 Добавить приватный бизнес-tool в `internal/*` (project-specific)
+
+Используйте этот вариант, когда инструмент содержит приватную доменную логику/адаптеры и не должен становиться публичным API пакетов.
+
+Рекомендуемый layout:
+
+```text
+internal/
+  support/
+    tools/
+      ticket_create.go
+```
+
+Регистрация в runtime wiring (`cmd/agent-core/runtime.go`):
+
+```go
+ticketTool := supporttools.NewTicketCreateTool(ticketClient)
+if err := toolRegistry.Register(ticketTool); err != nil {
+    return nil, err
+}
+```
+
+Так архитектура остается чистой:
+
+- доменно-специфичный код остается приватным в `internal/*`;
+- core loop, phase control и контракты tool execution остаются без изменений.
+
+### 11.8 Добавить новый skill
+
+`skill` = пакет инструментов + prompt additions + optional pipeline mutations.
 
 ```go
 type SupportSkill struct{}
@@ -657,9 +767,7 @@ func (s *SupportSkill) Register(reg *tools.Registry) error {
     return nil
 }
 func (s *SupportSkill) PromptAdditions() []string {
-    return []string{
-        "Skill support enabled: verify customer status before creating any ticket.",
-    }
+    return []string{"Skill support enabled: verify customer status before creating any ticket."}
 }
 ```
 
@@ -668,28 +776,175 @@ func (s *SupportSkill) PromptAdditions() []string {
 1. `skillRegistry.Register(&SupportSkill{})`
 2. `AGENT_CORE_SKILLS=ops,support`
 
-### 11.3 Подключение MCP инструментов
+### 11.9 Подключить MCP tools
 
 1. Включить `AGENT_CORE_MCP_ENABLED=true`
-2. Задать `AGENT_CORE_MCP_SERVERS`
-3. (Опционально) токены через `MCP_TOKEN_<SERVER>`
+2. Настроить `AGENT_CORE_MCP_SERVERS`
+3. (Опционально) передать токены через `MCP_TOKEN_<SERVER>`
 
-После импорта инструменты будут доступны как:
+После импорта инструменты доступны как `mcp.<server>.<tool>`.
 
-- `mcp.<server>.<tool>`
-
-### 11.4 Контракт финального ответа (JSON Schema)
-
-Можно заставить агента возвращать строго структурированный ответ:
+### 11.10 Контракт финального ответа (JSON Schema)
 
 ```powershell
 $env:AGENT_CORE_OUTPUT_JSON_SCHEMA='{"type":"object","required":["answer","confidence"],"properties":{"answer":{"type":"string"},"confidence":{"type":"number","minimum":0,"maximum":1}},"additionalProperties":false}'
 ```
 
-Если ответ невалиден:
+Если финальный output невалиден:
 
 - агент делает до `AGENT_CORE_OUTPUT_VALIDATION_RETRIES` повторов;
-- в память добавляется системная подсказка о необходимости скорректировать финальный ответ.
+- в память добавляется системная коррекция, чтобы принудить совместимый финальный ответ.
+
+### 11.11 Internal incident-response bundle (real business case)
+
+The repository now includes a concrete private business implementation under `internal/*`: an incident-response/NOC agent bundle.
+It is opt-in and enabled by `AGENT_CORE_BUNDLE_ENABLED=true` (historical env name preserved for compatibility).
+
+Current structure:
+
+```text
+internal/
+  bundle.go
+  tools/
+    service_lookup_tool.go
+    runbook_lookup_tool.go
+    oncall_lookup_tool.go
+    incident_create_tool.go
+    incident_update_tool.go
+    incident_status_tool.go
+    incident_store.go
+  skills/
+    incident_ops_skill.go
+  pipeline/
+    input_sanitizer.go
+    input_gate_stage.go
+    post_reflect_audit_stage.go
+    pipeline_mutations.go
+  interceptors/
+    normalize_trace_interceptor.go
+    context_enrichment_interceptor.go
+    after_tool_execution_state_interceptor.go
+    stop_policy_interceptor.go
+    finalize_trace_interceptor.go
+    tool_policy_interceptor.go
+    tool_rewrite_interceptor.go
+    tool_fallback_interceptor.go
+```
+
+Runtime wiring when bundle is enabled (`cmd/agent-core/runtime.go`):
+
+- registers private tools and appends them to tool allowlist automatically;
+- registers private phase interceptors and tool execution interceptors;
+- injects private pipeline mutations (`sanitize`, `_input_gate`, `_post_reflect_audit`);
+- registers internal skill `incident_ops` in shared skill registry (activate via `AGENT_CORE_SKILLS`);
+- appends deterministic prompt hints for incident workflows.
+
+Business tools in this bundle:
+
+- read-only triage tools:
+  - `.service.lookup` (service metadata, owner team, runbook, dependencies, default severity)
+  - `.runbook.lookup` (scenario-specific runbook steps + verification checklist)
+  - `.oncall.lookup` (primary/secondary escalation contacts)
+  - `.incident.status` (current incident state + timeline summary)
+- mutating orchestration tools:
+  - `.incident.create` (create incident, derive defaults, initialize timeline)
+  - `.incident.update` (status transitions, note/next_action, assignee changes)
+
+Deterministic controls included:
+
+- input control: sanitizer + blocked-phrase gate before planning;
+- context enrichment: incident intent/severity inference, session-state snapshot hints, optional MCP capability hints;
+- tool governance: deny/prefix policy, argument rewrites, deterministic fallback payloads for selected read-only failures;
+- stop/finalize control: iteration cap + final trace markers.
+
+Recommended env for this business case:
+
+```powershell
+$env:AGENT_CORE_BUNDLE_ENABLED="true"
+$env:AGENT_CORE_SKILLS="ops,incident_ops"
+$env:AGENT_CORE_TOOLS_ALLOWLIST="time.now,kv.put,kv.get,http.get,.service.lookup,.runbook.lookup,.oncall.lookup,.incident.create,.incident.update,.incident.status"
+```
+
+Notes:
+
+- private bundle tools are auto-appended to allowlist when enabled, so explicit listing is optional but recommended for audit clarity;
+- `incident_ops` is guidance-focused (prompt additions), while domain logic and side effects stay in `internal/tools`;
+- this is a real reference implementation, not placeholder `example_*` stubs.
+
+### 11.12 Build your own internal bundle (detailed playbook)
+
+Use this sequence to implement your own business case without changing core runtime contracts.
+
+1. Define domain boundaries first.
+- List entities, mutable operations, and irreversible side effects.
+- Classify each operation as read-only or mutating.
+- Decide which failures must hard-fail and which may degrade.
+
+2. Model private domain data in `internal/*`.
+- Implement deterministic adapters/stores first (service clients, repositories, fixtures for tests).
+- Keep business API private; avoid leaking it into reusable `pkg/*`.
+
+3. Implement tools with strict schemas.
+- Each tool implements `tools.Tool` with explicit JSON input/output schema.
+- Add `RetryPolicy` intentionally (`IsReadOnly`, `IsSafeRetry`).
+- Add `CachePolicy` only for genuinely stable read paths.
+
+4. Add a domain skill for planning guidance.
+- Implement `skills.Skill` in `internal/skills`.
+- Keep side effects in tools; use skill for planner hints and workflow guidance.
+- Activate through `AGENT_CORE_SKILLS` exactly like standard reusable skills.
+
+5. Add pipeline mutations only for structural stage changes.
+- Use `stages.InsertBefore/After`, `Replace`, `Remove` for topology changes.
+- Keep custom stages deterministic and cheap; avoid network I/O there.
+
+6. Add phase interceptors for deterministic policies.
+- `ENRICH_CONTEXT`: inject private context and retrieved docs.
+- `AFTER_TOOL_EXECUTION`: derive compact state for next planner step.
+- `STOP_CHECK` and `FINALIZE`: enforce business stop rules and diagnostics.
+
+7. Add tool execution interceptors for centralized governance.
+- Policy interceptor: block tool names/prefixes.
+- Rewrite interceptor: normalize/fill args before execution.
+- Fallback interceptor: return deterministic safe payloads for selected read-only failures.
+
+8. Aggregate everything in one bundle object.
+- Expose `RegisterTools`, `RegisterSkills`, `RegisterInterceptors`, `PipelineMutations`, `PromptAdditions`.
+- Keep runtime wiring composable and minimal.
+
+Reference skeleton:
+
+```go
+type Bundle struct {
+    Tools  []tools.Tool
+    Skills []skills.Skill
+}
+
+func NewBundle() *Bundle { /* build domain components */ }
+func (b *Bundle) RegisterTools(reg *tools.Registry) error { /* ... */ }
+func (b *Bundle) RegisterSkills(reg *skills.Registry) error { /* ... */ }
+func (b *Bundle) RegisterInterceptors(ir *core.InterceptorRegistry) { /* ... */ }
+func (b *Bundle) PipelineMutations() []stages.PipelineMutation { /* ... */ }
+func (b *Bundle) PromptAdditions() []string { /* ... */ }
+```
+
+9. Wire the bundle behind one feature flag in `cmd/agent-core/runtime.go`.
+- Instantiate only when the flag is enabled.
+- Register/apply skills, then register tools/interceptors.
+- Merge prompt additions and pipeline mutations into runtime config.
+
+10. Configure env explicitly.
+- Enable bundle: `AGENT_CORE_BUNDLE_ENABLED=true`.
+- Enable skills: `AGENT_CORE_SKILLS=ops,<your_skill>`.
+- Keep explicit tool allowlist and per-tool error policy.
+- Tune guardrails and output schema to downstream contract.
+
+11. Build a rollout test matrix.
+- Unit tests per tool (schema, happy path, edge cases, retry/cache flags).
+- Unit tests for interceptors and pipeline mutations.
+- Runtime integration tests for end-to-end flow and stop reasons.
+- HTTP contract tests for `/v1/agent/run`.
+- Negative tests for blocked input, blocked tools, fallback branches, and mutating tool failure behavior.
 
 ---
 
@@ -864,15 +1119,15 @@ go tool cover -func=coverage.out
 
 Полезные тестовые пакеты:
 
-- `internal/agent/*_test.go` — жизненный цикл агента, tool error policy, snapshot restore.
-- `internal/planner/planner_test.go` — JSON retries и tool selection policy.
-- `internal/tools/*_test.go` — allowlist/security/retry/cache/dedup.
-- `internal/llm/*_test.go` — provider cache/stream/token metrics.
+- `core/pipeline_test.go, pkg/stages/*_test.go` — жизненный цикл агента, tool error policy, short-term snapshot restore.
+- `pkg/planner/*_test.go` — JSON retries и tool selection policy.
+- `pkg/tools/*_test.go` — allowlist/security/retry/cache/dedup.
+- `pkg/llm/*_test.go, pkg/telemetry/*_test.go` — provider cache/stream/token metrics.
 - `cmd/agent-core/server_test.go` — HTTP контракт и first-only.
 
 Golden fixture для стабильного runtime-контракта:
 
-- `internal/agent/testdata/run_result.golden.json`
+- `core run contract is validated by cmd/agent-core/server_test.go`
 
 ---
 

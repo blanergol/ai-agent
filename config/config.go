@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/blanergol/agent-core/pkg/helpers"
 )
 
 // Поддерживаемые идентификаторы LLM-провайдеров.
@@ -54,6 +56,8 @@ type Config struct {
 	Langfuse LangfuseConfig `mapstructure:"langfuse"`
 	// Skills содержит список активируемых наборов инструментов.
 	Skills []string `mapstructure:"skills"`
+	// Bundle controls opt-in internal Bundle pipeline/business extensions.
+	Bundle BundleConfig `mapstructure:"bundle"`
 }
 
 // LLMConfig объединяет параметры подключения к LLM и генерации ответов.
@@ -190,6 +194,16 @@ type AgentConfig struct {
 	MaxInputChars int `mapstructure:"max_input_chars"`
 	// Deterministic включает воспроизводимый режим runtime (stable ids, deterministic behavior).
 	Deterministic bool `mapstructure:"deterministic"`
+	// MCPEnrichmentSources задаёт детерминированные MCP-вызовы для фазы ENRICH_CONTEXT.
+	MCPEnrichmentSources []MCPEnrichmentSource `mapstructure:"mcp_enrichment_sources"`
+}
+
+// MCPEnrichmentSource describes one deterministic enrichment tool call.
+type MCPEnrichmentSource struct {
+	Name     string          `json:"name" mapstructure:"name"`
+	ToolName string          `json:"tool_name" mapstructure:"tool_name"`
+	Args     json.RawMessage `json:"args" mapstructure:"args"`
+	Required bool            `json:"required" mapstructure:"required"`
 }
 
 // GuardrailsConfig задаёт hard-лимиты безопасности во время выполнения.
@@ -268,6 +282,11 @@ type LangfuseModelPrice struct {
 	InputPer1M float64 `json:"input_per_1m" mapstructure:"input_per_1m"`
 	// OutputPer1M задаёт стоимость выходных токенов (USD за 1M токенов).
 	OutputPer1M float64 `json:"output_per_1m" mapstructure:"output_per_1m"`
+}
+
+// BundleConfig controls opt-in internal bundle runtime extensions.
+type BundleConfig struct {
+	Enabled bool `mapstructure:"enabled"`
 }
 
 // DefaultConfig возвращает безопасные значения по умолчанию для локального запуска.
@@ -359,6 +378,9 @@ func DefaultConfig() Config {
 			ModelPrices:    map[string]LangfuseModelPrice{},
 		},
 		Skills: []string{"ops"},
+		Bundle: BundleConfig{
+			Enabled: false,
+		},
 	}
 }
 
@@ -380,165 +402,165 @@ func Load() (Config, error) {
 
 // applyEnv применяет явные переопределения из переменных окружения.
 func applyEnv(cfg *Config) error {
-	cfg.Mode = envString("AGENT_CORE_MODE", cfg.Mode)
+	cfg.Mode = helpers.EnvString("AGENT_CORE_MODE", cfg.Mode)
 
-	cfg.LLM.Provider = envString("AGENT_CORE_LLM_PROVIDER", cfg.LLM.Provider)
-	cfg.LLM.Model = envString("AGENT_CORE_LLM_MODEL", cfg.LLM.Model)
-	cfg.LLM.BaseURL = envString("AGENT_CORE_LLM_BASE_URL", cfg.LLM.BaseURL)
-	cfg.LLM.OpenAIAPIKey = envString("AGENT_CORE_LLM_OPENAI_API_KEY", cfg.LLM.OpenAIAPIKey)
-	cfg.LLM.OpenRouterAPIKey = envString("AGENT_CORE_LLM_OPENROUTER_API_KEY", cfg.LLM.OpenRouterAPIKey)
-	cfg.LLM.OpenRouterHTTPReferer = envString("AGENT_CORE_LLM_OPENROUTER_HTTP_REFERER", cfg.LLM.OpenRouterHTTPReferer)
-	cfg.LLM.OpenRouterAppTitle = envString("AGENT_CORE_LLM_OPENROUTER_APP_TITLE", cfg.LLM.OpenRouterAppTitle)
+	cfg.LLM.Provider = helpers.EnvString("AGENT_CORE_LLM_PROVIDER", cfg.LLM.Provider)
+	cfg.LLM.Model = helpers.EnvString("AGENT_CORE_LLM_MODEL", cfg.LLM.Model)
+	cfg.LLM.BaseURL = helpers.EnvString("AGENT_CORE_LLM_BASE_URL", cfg.LLM.BaseURL)
+	cfg.LLM.OpenAIAPIKey = helpers.EnvString("AGENT_CORE_LLM_OPENAI_API_KEY", cfg.LLM.OpenAIAPIKey)
+	cfg.LLM.OpenRouterAPIKey = helpers.EnvString("AGENT_CORE_LLM_OPENROUTER_API_KEY", cfg.LLM.OpenRouterAPIKey)
+	cfg.LLM.OpenRouterHTTPReferer = helpers.EnvString("AGENT_CORE_LLM_OPENROUTER_HTTP_REFERER", cfg.LLM.OpenRouterHTTPReferer)
+	cfg.LLM.OpenRouterAppTitle = helpers.EnvString("AGENT_CORE_LLM_OPENROUTER_APP_TITLE", cfg.LLM.OpenRouterAppTitle)
 
-	if v, ok, err := envFloat64("AGENT_CORE_LLM_TEMPERATURE"); err != nil {
+	if v, ok, err := helpers.EnvFloat64("AGENT_CORE_LLM_TEMPERATURE"); err != nil {
 		return err
 	} else if ok {
 		cfg.LLM.Temperature = v
 	}
-	if v, ok, err := envFloat64("AGENT_CORE_LLM_TOP_P"); err != nil {
+	if v, ok, err := helpers.EnvFloat64("AGENT_CORE_LLM_TOP_P"); err != nil {
 		return err
 	} else if ok {
 		cfg.LLM.TopP = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_LLM_SEED"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_LLM_SEED"); err != nil {
 		return err
 	} else if ok {
 		cfg.LLM.Seed = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_LLM_MAX_OUTPUT_TOKENS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_LLM_MAX_OUTPUT_TOKENS"); err != nil {
 		return err
 	} else if ok {
 		cfg.LLM.MaxOutputTokens = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_LLM_TIMEOUT_MS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_LLM_TIMEOUT_MS"); err != nil {
 		return err
 	} else if ok {
 		cfg.LLM.TimeoutMs = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_LLM_MAX_RETRIES"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_LLM_MAX_RETRIES"); err != nil {
 		return err
 	} else if ok {
 		cfg.LLM.MaxRetries = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_LLM_RETRY_BASE_MS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_LLM_RETRY_BASE_MS"); err != nil {
 		return err
 	} else if ok {
 		cfg.LLM.RetryBaseMs = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_LLM_MAX_PARALLEL"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_LLM_MAX_PARALLEL"); err != nil {
 		return err
 	} else if ok {
 		cfg.LLM.MaxParallel = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_LLM_CIRCUIT_BREAKER_FAILURES"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_LLM_CIRCUIT_BREAKER_FAILURES"); err != nil {
 		return err
 	} else if ok {
 		cfg.LLM.CircuitBreakerFailures = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_LLM_CIRCUIT_BREAKER_COOLDOWN_MS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_LLM_CIRCUIT_BREAKER_COOLDOWN_MS"); err != nil {
 		return err
 	} else if ok {
 		cfg.LLM.CircuitBreakerCooldownMs = v
 	}
-	if v, ok, err := envBool("AGENT_CORE_LLM_DISABLE_JITTER"); err != nil {
+	if v, ok, err := helpers.EnvBool("AGENT_CORE_LLM_DISABLE_JITTER"); err != nil {
 		return err
 	} else if ok {
 		cfg.LLM.DisableJitter = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_LLM_CACHE_TTL_MS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_LLM_CACHE_TTL_MS"); err != nil {
 		return err
 	} else if ok {
 		cfg.LLM.CacheTTLms = v
 	}
 
-	if v, ok, err := envInt("AGENT_CORE_MEMORY_SHORT_TERM_MAX_MESSAGES"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_MEMORY_SHORT_TERM_MAX_MESSAGES"); err != nil {
 		return err
 	} else if ok {
 		cfg.Memory.ShortTermMaxMessages = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_MEMORY_RECALL_TOP_K"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_MEMORY_RECALL_TOP_K"); err != nil {
 		return err
 	} else if ok {
 		cfg.Memory.RecallTopK = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_MEMORY_TOKEN_BUDGET"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_MEMORY_TOKEN_BUDGET"); err != nil {
 		return err
 	} else if ok {
 		cfg.Memory.TokenBudget = v
 	}
 
-	if v, ok, err := envInt("AGENT_CORE_PLANNER_MAX_STEPS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_PLANNER_MAX_STEPS"); err != nil {
 		return err
 	} else if ok {
 		cfg.Planner.MaxSteps = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_PLANNER_MAX_PLANNING_RETRIES"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_PLANNER_MAX_PLANNING_RETRIES"); err != nil {
 		return err
 	} else if ok {
 		cfg.Planner.MaxPlanningRetries = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_PLANNER_ACTION_JSON_RETRIES"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_PLANNER_ACTION_JSON_RETRIES"); err != nil {
 		return err
 	} else if ok {
 		cfg.Planner.ActionJSONRetries = v
 	}
 
-	if v, ok := envCSV("AGENT_CORE_TOOLS_ALLOWLIST"); ok {
+	if v, ok := helpers.EnvCSV("AGENT_CORE_TOOLS_ALLOWLIST"); ok {
 		cfg.Tools.Allowlist = v
 	}
-	if v, ok := envCSV("AGENT_CORE_TOOLS_DENYLIST"); ok {
+	if v, ok := helpers.EnvCSV("AGENT_CORE_TOOLS_DENYLIST"); ok {
 		cfg.Tools.Denylist = v
 	}
-	if v, ok := envCSV("AGENT_CORE_TOOLS_HTTP_ALLOW_DOMAINS"); ok {
+	if v, ok := helpers.EnvCSV("AGENT_CORE_TOOLS_HTTP_ALLOW_DOMAINS"); ok {
 		cfg.Tools.HTTPAllowDomains = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_TOOLS_DEFAULT_TIMEOUT_MS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_TOOLS_DEFAULT_TIMEOUT_MS"); err != nil {
 		return err
 	} else if ok {
 		cfg.Tools.DefaultTimeoutMs = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_TOOLS_MAX_EXECUTION_RETRIES"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_TOOLS_MAX_EXECUTION_RETRIES"); err != nil {
 		return err
 	} else if ok {
 		cfg.Tools.MaxExecutionRetries = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_TOOLS_RETRY_BASE_MS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_TOOLS_RETRY_BASE_MS"); err != nil {
 		return err
 	} else if ok {
 		cfg.Tools.RetryBaseMs = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_TOOLS_MAX_PARALLEL"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_TOOLS_MAX_PARALLEL"); err != nil {
 		return err
 	} else if ok {
 		cfg.Tools.MaxParallel = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_TOOLS_DEDUP_TTL_MS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_TOOLS_DEDUP_TTL_MS"); err != nil {
 		return err
 	} else if ok {
 		cfg.Tools.DedupTTLms = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_TOOLS_MAX_OUTPUT_BYTES"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_TOOLS_MAX_OUTPUT_BYTES"); err != nil {
 		return err
 	} else if ok {
 		cfg.Tools.MaxOutputBytes = v
 	}
-	if v, ok, err := envInt64("AGENT_CORE_TOOLS_HTTP_MAX_BODY_BYTES"); err != nil {
+	if v, ok, err := helpers.EnvInt64("AGENT_CORE_TOOLS_HTTP_MAX_BODY_BYTES"); err != nil {
 		return err
 	} else if ok {
 		cfg.Tools.HTTPMaxBodyBytes = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_TOOLS_HTTP_TIMEOUT_MS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_TOOLS_HTTP_TIMEOUT_MS"); err != nil {
 		return err
 	} else if ok {
 		cfg.Tools.HTTPTimeoutMs = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_TOOLS_HTTP_READ_CACHE_TTL_MS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_TOOLS_HTTP_READ_CACHE_TTL_MS"); err != nil {
 		return err
 	} else if ok {
 		cfg.Tools.HTTPReadCacheTTLms = v
 	}
 
-	if v, ok, err := envBool("AGENT_CORE_MCP_ENABLED"); err != nil {
+	if v, ok, err := helpers.EnvBool("AGENT_CORE_MCP_ENABLED"); err != nil {
 		return err
 	} else if ok {
 		cfg.MCP.Enabled = v
@@ -552,25 +574,25 @@ func applyEnv(cfg *Config) error {
 		cfg.MCP.Servers = servers
 	}
 
-	cfg.State.PersistPath = envString("AGENT_CORE_STATE_PERSIST_PATH", cfg.State.PersistPath)
-	cfg.State.CacheBackplaneDir = envString("AGENT_CORE_STATE_CACHE_BACKPLANE_DIR", cfg.State.CacheBackplaneDir)
-	if v, ok, err := envInt("AGENT_CORE_STATE_TIMEOUT_MS"); err != nil {
+	cfg.State.PersistPath = helpers.EnvString("AGENT_CORE_STATE_PERSIST_PATH", cfg.State.PersistPath)
+	cfg.State.CacheBackplaneDir = helpers.EnvString("AGENT_CORE_STATE_CACHE_BACKPLANE_DIR", cfg.State.CacheBackplaneDir)
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_STATE_TIMEOUT_MS"); err != nil {
 		return err
 	} else if ok {
 		cfg.State.TimeoutMs = v
 	}
 
-	if v, ok, err := envInt("AGENT_CORE_AGENT_MAX_STEP_DURATION_MS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_AGENT_MAX_STEP_DURATION_MS"); err != nil {
 		return err
 	} else if ok {
 		cfg.Agent.MaxStepDurationMs = v
 	}
-	if v, ok, err := envBool("AGENT_CORE_AGENT_CONTINUE_ON_TOOL_ERROR"); err != nil {
+	if v, ok, err := helpers.EnvBool("AGENT_CORE_AGENT_CONTINUE_ON_TOOL_ERROR"); err != nil {
 		return err
 	} else if ok {
 		cfg.Agent.ContinueOnToolError = v
 	}
-	cfg.Agent.ToolErrorMode = envString("AGENT_CORE_AGENT_TOOL_ERROR_MODE", cfg.Agent.ToolErrorMode)
+	cfg.Agent.ToolErrorMode = helpers.EnvString("AGENT_CORE_AGENT_TOOL_ERROR_MODE", cfg.Agent.ToolErrorMode)
 	if raw, ok := os.LookupEnv("AGENT_CORE_AGENT_TOOL_ERROR_FALLBACK"); ok {
 		parsed, err := parseToolErrorFallback(raw)
 		if err != nil {
@@ -578,96 +600,103 @@ func applyEnv(cfg *Config) error {
 		}
 		cfg.Agent.ToolErrorFallback = parsed
 	}
-	if v, ok, err := envInt("AGENT_CORE_AGENT_MAX_INPUT_CHARS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_AGENT_MAX_INPUT_CHARS"); err != nil {
 		return err
 	} else if ok {
 		cfg.Agent.MaxInputChars = v
 	}
-	if v, ok, err := envBool("AGENT_CORE_AGENT_DETERMINISTIC"); err != nil {
+	if v, ok, err := helpers.EnvBool("AGENT_CORE_AGENT_DETERMINISTIC"); err != nil {
 		return err
 	} else if ok {
 		cfg.Agent.Deterministic = v
 	}
+	if raw, ok := os.LookupEnv("AGENT_CORE_AGENT_MCP_ENRICHMENT_SOURCES"); ok {
+		sources, err := parseMCPEnrichmentSources(raw)
+		if err != nil {
+			return err
+		}
+		cfg.Agent.MCPEnrichmentSources = sources
+	}
 
-	if v, ok, err := envInt("AGENT_CORE_GUARDRAILS_MAX_STEPS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_GUARDRAILS_MAX_STEPS"); err != nil {
 		return err
 	} else if ok {
 		cfg.Guardrails.MaxSteps = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_GUARDRAILS_MAX_TOOL_CALLS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_GUARDRAILS_MAX_TOOL_CALLS"); err != nil {
 		return err
 	} else if ok {
 		cfg.Guardrails.MaxToolCalls = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_GUARDRAILS_MAX_TIME_MS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_GUARDRAILS_MAX_TIME_MS"); err != nil {
 		return err
 	} else if ok {
 		cfg.Guardrails.MaxTimeMs = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_GUARDRAILS_MAX_TOOL_OUTPUT_BYTES"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_GUARDRAILS_MAX_TOOL_OUTPUT_BYTES"); err != nil {
 		return err
 	} else if ok {
 		cfg.Guardrails.MaxToolOutputBytes = v
 	}
 
-	if v, ok, err := envInt("AGENT_CORE_OUTPUT_MAX_CHARS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_OUTPUT_MAX_CHARS"); err != nil {
 		return err
 	} else if ok {
 		cfg.Output.MaxChars = v
 	}
-	if v, ok := envCSV("AGENT_CORE_OUTPUT_FORBIDDEN_SUBSTRINGS"); ok {
+	if v, ok := helpers.EnvCSV("AGENT_CORE_OUTPUT_FORBIDDEN_SUBSTRINGS"); ok {
 		cfg.Output.ForbiddenSubstrings = v
 	}
-	cfg.Output.JSONSchema = envString("AGENT_CORE_OUTPUT_JSON_SCHEMA", cfg.Output.JSONSchema)
-	if v, ok, err := envInt("AGENT_CORE_OUTPUT_VALIDATION_RETRIES"); err != nil {
+	cfg.Output.JSONSchema = helpers.EnvString("AGENT_CORE_OUTPUT_JSON_SCHEMA", cfg.Output.JSONSchema)
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_OUTPUT_VALIDATION_RETRIES"); err != nil {
 		return err
 	} else if ok {
 		cfg.Output.ValidationRetries = v
 	}
 
-	cfg.Auth.UserAuthHeader = envString("AGENT_CORE_AUTH_USER_AUTH_HEADER", cfg.Auth.UserAuthHeader)
+	cfg.Auth.UserAuthHeader = helpers.EnvString("AGENT_CORE_AUTH_USER_AUTH_HEADER", cfg.Auth.UserAuthHeader)
 
-	if v, ok, err := envBool("AGENT_CORE_LOGGING_DEBUG"); err != nil {
+	if v, ok, err := helpers.EnvBool("AGENT_CORE_LOGGING_DEBUG"); err != nil {
 		return err
 	} else if ok {
 		cfg.Logging.Debug = v
 	}
-	if v, ok, err := envBool("AGENT_CORE_LOGGING_VERBOSE_TRACING"); err != nil {
+	if v, ok, err := helpers.EnvBool("AGENT_CORE_LOGGING_VERBOSE_TRACING"); err != nil {
 		return err
 	} else if ok {
 		cfg.Logging.VerboseTracing = v
 	}
-	if v, ok, err := envBool("AGENT_CORE_LOGGING_DEBUG_ARTIFACTS"); err != nil {
+	if v, ok, err := helpers.EnvBool("AGENT_CORE_LOGGING_DEBUG_ARTIFACTS"); err != nil {
 		return err
 	} else if ok {
 		cfg.Logging.DebugArtifacts = v
 	}
-	if v, ok, err := envInt("AGENT_CORE_LOGGING_DEBUG_ARTIFACTS_MAX_CHARS"); err != nil {
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_LOGGING_DEBUG_ARTIFACTS_MAX_CHARS"); err != nil {
 		return err
 	} else if ok {
 		cfg.Logging.DebugArtifactsMaxChars = v
 	}
-	if v, ok, err := envBool("AGENT_CORE_WEB_UI_ENABLED"); err != nil {
+	if v, ok, err := helpers.EnvBool("AGENT_CORE_WEB_UI_ENABLED"); err != nil {
 		return err
 	} else if ok {
 		cfg.WebUI.Enabled = v
 	}
-	if v, ok, err := envBool("AGENT_CORE_LANGFUSE_ENABLED"); err != nil {
+	if v, ok, err := helpers.EnvBool("AGENT_CORE_LANGFUSE_ENABLED"); err != nil {
 		return err
 	} else if ok {
 		cfg.Langfuse.Enabled = v
 	}
-	cfg.Langfuse.Host = envString("AGENT_CORE_LANGFUSE_HOST", cfg.Langfuse.Host)
-	cfg.Langfuse.PublicKey = envString("AGENT_CORE_LANGFUSE_PUBLIC_KEY", cfg.Langfuse.PublicKey)
-	cfg.Langfuse.SecretKey = envString("AGENT_CORE_LANGFUSE_SECRET_KEY", cfg.Langfuse.SecretKey)
-	if v, ok, err := envInt("AGENT_CORE_LANGFUSE_TIMEOUT_MS"); err != nil {
+	cfg.Langfuse.Host = helpers.EnvString("AGENT_CORE_LANGFUSE_HOST", cfg.Langfuse.Host)
+	cfg.Langfuse.PublicKey = helpers.EnvString("AGENT_CORE_LANGFUSE_PUBLIC_KEY", cfg.Langfuse.PublicKey)
+	cfg.Langfuse.SecretKey = helpers.EnvString("AGENT_CORE_LANGFUSE_SECRET_KEY", cfg.Langfuse.SecretKey)
+	if v, ok, err := helpers.EnvInt("AGENT_CORE_LANGFUSE_TIMEOUT_MS"); err != nil {
 		return err
 	} else if ok {
 		cfg.Langfuse.TimeoutMs = v
 	}
-	cfg.Langfuse.ServiceName = envString("AGENT_CORE_LANGFUSE_SERVICE_NAME", cfg.Langfuse.ServiceName)
-	cfg.Langfuse.ServiceVersion = envString("AGENT_CORE_LANGFUSE_SERVICE_VERSION", cfg.Langfuse.ServiceVersion)
-	cfg.Langfuse.Environment = envString("AGENT_CORE_LANGFUSE_ENVIRONMENT", cfg.Langfuse.Environment)
+	cfg.Langfuse.ServiceName = helpers.EnvString("AGENT_CORE_LANGFUSE_SERVICE_NAME", cfg.Langfuse.ServiceName)
+	cfg.Langfuse.ServiceVersion = helpers.EnvString("AGENT_CORE_LANGFUSE_SERVICE_VERSION", cfg.Langfuse.ServiceVersion)
+	cfg.Langfuse.Environment = helpers.EnvString("AGENT_CORE_LANGFUSE_ENVIRONMENT", cfg.Langfuse.Environment)
 	if raw, ok := os.LookupEnv("AGENT_CORE_LANGFUSE_MODEL_PRICES"); ok {
 		modelPrices, err := parseLangfuseModelPrices(raw)
 		if err != nil {
@@ -676,8 +705,13 @@ func applyEnv(cfg *Config) error {
 		cfg.Langfuse.ModelPrices = modelPrices
 	}
 
-	if v, ok := envCSV("AGENT_CORE_SKILLS"); ok {
+	if v, ok := helpers.EnvCSV("AGENT_CORE_SKILLS"); ok {
 		cfg.Skills = v
+	}
+	if v, ok, err := helpers.EnvBool("AGENT_CORE_BUNDLE_ENABLED"); err != nil {
+		return err
+	} else if ok {
+		cfg.Bundle.Enabled = v
 	}
 
 	return nil
@@ -904,6 +938,14 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("AGENT_CORE_AGENT_TOOL_ERROR_FALLBACK[%s] must be fail|continue", tool)
 		}
 	}
+	for idx, source := range cfg.Agent.MCPEnrichmentSources {
+		if strings.TrimSpace(source.ToolName) == "" {
+			return fmt.Errorf("AGENT_CORE_AGENT_MCP_ENRICHMENT_SOURCES[%d].tool_name must be non-empty", idx)
+		}
+		if len(source.Args) > 0 && !json.Valid(source.Args) {
+			return fmt.Errorf("AGENT_CORE_AGENT_MCP_ENRICHMENT_SOURCES[%d].args must be valid JSON", idx)
+		}
+	}
 	return nil
 }
 
@@ -968,6 +1010,29 @@ func parseMCPServers(raw string) ([]MCPServerConfig, error) {
 	return servers, nil
 }
 
+// parseMCPEnrichmentSources parses deterministic MCP enrichment sources from JSON array.
+func parseMCPEnrichmentSources(raw string) ([]MCPEnrichmentSource, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return []MCPEnrichmentSource{}, nil
+	}
+	var sources []MCPEnrichmentSource
+	if err := json.Unmarshal([]byte(raw), &sources); err != nil {
+		return nil, fmt.Errorf("parse AGENT_CORE_AGENT_MCP_ENRICHMENT_SOURCES as JSON: %w", err)
+	}
+	for i := range sources {
+		sources[i].Name = strings.TrimSpace(sources[i].Name)
+		sources[i].ToolName = strings.TrimSpace(sources[i].ToolName)
+		if len(sources[i].Args) == 0 {
+			sources[i].Args = json.RawMessage("{}")
+		}
+		if !json.Valid(sources[i].Args) {
+			return nil, fmt.Errorf("invalid MCP enrichment args at index %d", i)
+		}
+	}
+	return sources, nil
+}
+
 // parseToolErrorFallback разбирает fallback-правила tool_error_fallback из JSON или CSV-формата.
 func parseToolErrorFallback(raw string) (map[string]string, error) {
 	raw = strings.TrimSpace(raw)
@@ -1003,7 +1068,7 @@ func parseToolErrorFallback(raw string) (map[string]string, error) {
 }
 
 // parseLangfuseModelPrices parses JSON object with per-model pricing.
-// Example:
+// Bundle:
 // {"openai/gpt-4o-mini":{"input_per_1m":0.15,"output_per_1m":0.6}}
 func parseLangfuseModelPrices(raw string) (map[string]LangfuseModelPrice, error) {
 	raw = strings.TrimSpace(raw)
@@ -1026,88 +1091,4 @@ func parseLangfuseModelPrices(raw string) (map[string]LangfuseModelPrice, error)
 		}
 	}
 	return normalized, nil
-}
-
-// envString возвращает строку из окружения или fallback при отсутствии ключа.
-func envString(key, fallback string) string {
-	if v, ok := os.LookupEnv(key); ok {
-		return strings.TrimSpace(v)
-	}
-	return fallback
-}
-
-// envCSV разбирает comma-separated значение в массив строк без пустых элементов.
-func envCSV(key string) ([]string, bool) {
-	raw, ok := os.LookupEnv(key)
-	if !ok {
-		return nil, false
-	}
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return []string{}, true
-	}
-	// items содержит сырые элементы списка до trim и фильтрации.
-	items := strings.Split(raw, ",")
-	// out собирает нормализованный список значений.
-	out := make([]string, 0, len(items))
-	for _, item := range items {
-		item = strings.TrimSpace(item)
-		if item == "" {
-			continue
-		}
-		out = append(out, item)
-	}
-	return out, true
-}
-
-// envInt читает обязательный целочисленный override и возвращает флаг наличия.
-func envInt(key string) (int, bool, error) {
-	raw, ok := os.LookupEnv(key)
-	if !ok {
-		return 0, false, nil
-	}
-	v, err := strconv.Atoi(strings.TrimSpace(raw))
-	if err != nil {
-		return 0, false, fmt.Errorf("invalid %s: %w", key, err)
-	}
-	return v, true, nil
-}
-
-// envInt64 аналогичен envInt, но для диапазона int64.
-func envInt64(key string) (int64, bool, error) {
-	raw, ok := os.LookupEnv(key)
-	if !ok {
-		return 0, false, nil
-	}
-	v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
-	if err != nil {
-		return 0, false, fmt.Errorf("invalid %s: %w", key, err)
-	}
-	return v, true, nil
-}
-
-// envFloat64 читает вещественное значение и валидирует формат.
-func envFloat64(key string) (float64, bool, error) {
-	raw, ok := os.LookupEnv(key)
-	if !ok {
-		return 0, false, nil
-	}
-	v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
-	if err != nil {
-		return 0, false, fmt.Errorf("invalid %s: %w", key, err)
-	}
-	return v, true, nil
-}
-
-// envBool читает логическое значение из окружения.
-func envBool(key string) (bool, bool, error) {
-	raw, ok := os.LookupEnv(key)
-	if !ok {
-		return false, false, nil
-	}
-	v, err := strconv.ParseBool(strings.TrimSpace(raw))
-	if err != nil {
-		return false, false, fmt.Errorf("invalid %s: %w", key, err)
-	}
-	return v, true, nil
 }

@@ -6,7 +6,7 @@
 
 The project already includes:
 
-- an executable agent runtime with the `observe -> plan -> act -> reflect -> stop` loop;
+- an executable agent runtime with the `observe -> enrich_context -> plan -> act -> reflect -> stop` loop;
 - a strict JSON action planner (`tool | final | noop`);
 - a tool registry with security policies, retry/backoff, caching, and deduplication;
 - memory management (short-term + long-term), state/snapshot, and guardrails;
@@ -175,17 +175,59 @@ Errors:
 
 ## 4) Runtime Architecture
 
-### High-level flow
+### Pipeline loop (current implementation)
 
-1. Input (`CLI`/`HTTP`) -> `RunInput`.
-2. Session context is created/restored (`session_id`, `correlation_id`).
-3. `memory.BuildContext()` prepares planner observation.
-4. `planner.Plan()` returns a JSON action.
-5. `guardrails.ValidateAction()` applies safety checks.
-6. `agent.act()` executes `tool` or completes `final`.
-7. Step outputs are written to memory/state/telemetry.
-8. Final output is validated (`output policy + optional json schema`).
-9. `RunResult` is returned (`api_version=v1`) and runtime snapshot is persisted.
+Default stage order:
+
+1. `observe`
+2. `enrich_context`
+3. `plan`
+4. `act`
+5. `reflect`
+6. `stop`
+
+This stage loop is still executed by `core.Runtime.Run()` and is **not** replaced by custom business code.
+
+### Deterministic phases inside the loop
+
+Each stage uses explicit deterministic phases and `RunContext.ExecutePhase(...)`:
+
+- `INPUT` (runtime entry)
+- `NORMALIZE` (`sanitize` stage when enabled)
+- `GUARDRAILS` (observe + act validation points)
+- `ENRICH_CONTEXT` (`enrich_context` stage)
+- `DECIDE_ACTION` (`plan` stage, LLM planner)
+- `BEFORE_TOOL_EXECUTION` (`act`, tool path)
+- `TOOL_EXECUTION` (`act`, tool path through `ToolExecutor`)
+- `AFTER_TOOL_EXECUTION` (`act`, tool path)
+- `EVALUATE` (`reflect`)
+- `STOP_CHECK` (`reflect`)
+- `FINALIZE` (`stop`)
+
+This gives deterministic intervention points without changing base loop semantics.
+
+### State model used across all phases
+
+`RunContext.State` (`core.AgentState`) keeps centralized state for the run/iteration:
+
+- `raw_input`, `normalized_input`
+- `guardrail_results` counters/violations
+- deterministic `context` enrichment payloads
+- `retrieved_docs`
+- memory snapshot used for planning
+- `tool_calls_history` and `tool_results`
+- `errors`
+- `budgets` (token/time/cost fields)
+- trace/debug info (`phase` traces + iteration metrics)
+- `iteration` counter
+
+### How cycle control works
+
+The runtime loop is unchanged and driven by stage return control:
+
+- `StageControlContinue` -> continue next stage/iteration
+- `StageControlRetry` -> retry loop with optional backoff
+- `StageControlStop` -> build `RunResult` and exit
 
 ### Stop conditions
 
@@ -200,102 +242,38 @@ Loop stops when one of the following is true:
 
 ## 5) Codebase Map
 
-### Entry point
+### Layered structure
 
-- `cmd/agent-core/main.go`
-  - runtime dependency wiring;
-  - CLI commands `run` and `serve`;
-  - wiring chain: `config -> llm -> memory -> tools -> skills -> mcp -> planner -> guardrails -> agent`.
-- `cmd/agent-core/server.go`
-  - HTTP API (`/healthz`, `/v1/agent/run`) + Web UI routes;
-  - JSON decoding with body-size limit and `DisallowUnknownFields`.
-- `cmd/agent-core/webui.go`
-  - single-page built-in UI for manual agent testing;
-  - posts directly to `/v1/agent/run`.
+- `core/`
+  - framework contracts and orchestrator (`RunInput/RunResult`, `Action`, `Stage`, `Pipeline`, `Runtime`);
+  - deterministic phase model (`Phase`), centralized state (`AgentState`), interceptors, tool-executor abstraction;
+  - stage composition APIs (`InsertBefore/After`, `Replace`, `Remove`, hooks, middleware);
+  - stop/retry control model for stages.
+- `pkg/`
+  - reusable libraries with no `internal`/`cmd` dependency:
+  - `pkg/apperrors`, `pkg/redact`, `pkg/retry`, `pkg/cache`, `pkg/jsonx`, `pkg/state`, `pkg/llm`, `pkg/telemetry`;
+  - core runtime implementations: `pkg/planner`, `pkg/memory`, `pkg/guardrails`, `pkg/output`, `pkg/tools`, `pkg/mcp`, `pkg/stages`, `pkg/skills`.
+- `internal/`
+  - project-private domain code (business adapters/tools/policies that should not be exported).
+  - this repository includes a real incident-response bundle under `internal/*` (tools, skill, pipeline mutations, interceptors).
+- `cmd/`
+  - transports and entrypoints:
+  - `cmd/agent-core/main.go` CLI (`run`, `serve`);
+  - `cmd/agent-core/runtime.go` runtime wiring (`config -> llm -> tools/memory/guardrails -> runtime`);
+  - `cmd/agent-core/server.go` HTTP contract (`/healthz`, `/v1/agent/run`) depends only on `core.AgentRuntime`;
+  - `cmd/agent-core/webui.go` built-in UI.
 
-### Configuration
+### Domain implementations
 
-- `config/config.go`
-  - typed `Config` + `DefaultConfig()`;
-  - env loading, derived defaults, validation;
-  - parsing for `AGENT_CORE_MCP_SERVERS` and `AGENT_CORE_AGENT_TOOL_ERROR_FALLBACK`.
-
-### Agent and runtime contracts
-
-- `internal/agent/agent.go`
-  - main loop, planner retries, tool error policy, output validation.
-- `internal/agent/events.go`
-  - observable events (`run_started`, `step_planned`, `tool_failed`, ...).
-- `internal/agent/snapshot.go`, `kv_snapshot_store.go`
-  - `SnapshotStore` contract and `state.Store` implementation.
-- `internal/agent/contract_notes.go`
-  - changelog notes for public contract `v1`.
-
-### Planner
-
-- `internal/planner/planner.go`
-  - strict JSON action schema;
-  - `ChatJSON` + semantic validation + tool-policy validation + retries.
-- `internal/planner/tool_policy.go`
-  - tool-selection policy from current tool catalog.
-
-### Tools
-
-- `internal/tools/registry.go`
-  - allowlist/denylist;
-  - timeout + concurrency limiter;
-  - retry/backoff;
-  - dedup for mutating calls;
-  - read-cache (local + shared backplane);
-  - input/output JSON schema validation.
-- `internal/tools/kv.go`, `time_now.go`, `http_get.go`
-  - built-in tools.
-
-### LLM layer
-
-- `internal/llm/factory.go`
-  - provider selection (`openai`, `openrouter`, `ollama`, `lmstudio`).
-- `internal/llm/langchain_provider.go`
-  - model calls via `langchaingo`;
-  - circuit breaker, retry/backoff, cache, stream;
-  - token-usage metrics (`provider_native` or `estimated`).
-
-### Memory, state, guardrails
-
-- `internal/memory/memory.go`
-  - short-term window + long-term recall;
-  - token-budget trimming;
-  - write policy + redaction.
-- `internal/state/store.go`, `session_scope.go`
-  - thread-safe KV, atomic file persistence, session namespace.
-- `internal/guardrails/guardrails.go`
-  - limits for steps, time, tool calls, tool output bytes.
-
-### Security and output validation
-
-- `internal/output/*`
-  - policy validator + schema validator + composition.
-- `internal/redact/redact.go`
-  - masking of keys, bearer/JWT, email, private keys.
-- `internal/apperrors/errors.go`
-  - typed errors and HTTP mapping.
-
-### Integrations and extensibility
-
-- `internal/skills/*`
-  - skill registry, built-in `ops` skill.
-- `internal/mcp/mcp.go`
-  - import remote MCP tools as `mcp.<server>.<tool>`.
-- `internal/cache/backplane.go`
-  - `InMemoryBackplane` and `FileBackplane` for shared cache.
-
-### Telemetry
-
-- `internal/telemetry/*`
-  - session/correlation context;
-  - context-aware logger;
-  - tracer/metrics interfaces;
-  - debug artifacts sink.
+- Planner: `pkg/planner/*` (`ChatJSON`, semantic validation, tool policy).
+- Tool runtime and policies: `pkg/tools/*` (registry, retries, dedup, cache, validation).
+- Memory/guardrails: `pkg/memory/*`, `pkg/guardrails/*`.
+- Reusable state backend: `pkg/state/*` (KV store, session namespace, snapshot store).
+- Reusable LLM clients/runtime: `pkg/llm/*`.
+- Reusable observability contracts/backends: `pkg/telemetry/*`.
+- Built-in reusable primitives: `pkg/tools/*`, `pkg/skills/*`.
+- Output validation: `pkg/output/*`.
+- Integrations: `pkg/mcp/*`, `pkg/skills/*`.
 
 ---
 
@@ -324,13 +302,54 @@ Loop stops when one of the following is true:
 
 ### Skills
 
-Current built-in skill:
+Built-in reusable skill:
 
-- `ops` (`internal/skills/ops.go`)
+- `ops` (`pkg/skills/ops.go`)
   - registers `time.now` and `http.get`;
   - adds planner prompt hint.
 
+Optional internal skill (available when bundle is enabled):
+
+- `incident_ops` (`internal/skills/incident_ops_skill.go`)
+  - guidance-only skill (does not register tools by itself);
+  - adds deterministic incident workflow hints for planner behavior.
+
 Active skills are configured via `AGENT_CORE_SKILLS` (CSV).
+When `AGENT_CORE_BUNDLE_ENABLED=true`, add `incident_ops` explicitly (for example `AGENT_CORE_SKILLS=ops,incident_ops`) if you want the internal skill guidance.
+
+### Business Pipeline Extensions
+
+You have 3 extension levels, from simplest to strictest:
+
+1. Stage-level (`pkg/stages` + `stages.PipelineMutation`)
+- change stage order or inject custom stage (`InsertBefore/After`, `Replace`, `Remove`, `Append`).
+
+2. Phase-level (`core.InterceptorRegistry`)
+- register deterministic logic before/after any phase via `RegisterInterceptor(phase, interceptor)`.
+- best place for policy enforcement, context injection, fallback decisions, and stop-condition adjustments.
+
+3. Tool-level (`core.ToolExecutor` + tool interceptors)
+- run every tool call through a centralized executor.
+- can block/rewrite calls, add deterministic retries/fallbacks, enrich tracing, or route by policy.
+
+Minimal registration pattern:
+
+```go
+interceptors := core.NewInterceptorRegistry()
+interceptors.RegisterInterceptor(core.PhaseEnrichContext, myInterceptor)
+interceptors.RegisterToolInterceptor(myToolInterceptor)
+
+toolExecutor := core.NewRegistryToolExecutor(toolRegistry, interceptors)
+
+runtime := core.NewRuntime(cfg, core.RuntimeDeps{
+    // ...
+    Tools:        toolRegistry,
+    ToolExecutor: toolExecutor,
+    Interceptors: interceptors,
+}, pipeline)
+```
+
+The default deterministic example is `core.MCPContextEnrichment`, executed in `ENRICH_CONTEXT` before planner decision.
 
 ---
 
@@ -410,6 +429,19 @@ Important variables are grouped below. For complete behavior, check `config/Defa
     ```
 - secret fallback: `MCP_TOKEN_<SERVER_NAME>`
 
+Deterministic enrichment sources example:
+
+```json
+[
+  {
+    "name": "kb",
+    "tool_name": "mcp.docs.search",
+    "args": {"query": "current user task"},
+    "required": true
+  }
+]
+```
+
 ### State
 
 - `AGENT_CORE_STATE_PERSIST_PATH` (persisted KV state file)
@@ -426,6 +458,8 @@ If `CACHE_BACKPLANE_DIR` is empty but `PERSIST_PATH` is set, cache-backplane pat
 - `AGENT_CORE_AGENT_TOOL_ERROR_FALLBACK` (per-tool override, e.g. `ticket.create=fail,http.get=continue`)
 - `AGENT_CORE_AGENT_MAX_INPUT_CHARS`
 - `AGENT_CORE_AGENT_DETERMINISTIC`
+- `AGENT_CORE_BUNDLE_ENABLED` (enable internal incident-response bundle in `internal/*`)
+- `AGENT_CORE_AGENT_MCP_ENRICHMENT_SOURCES` (JSON array for deterministic `ENRICH_CONTEXT` MCP calls)
 - `AGENT_CORE_GUARDRAILS_MAX_STEPS`
 - `AGENT_CORE_GUARDRAILS_MAX_TOOL_CALLS`
 - `AGENT_CORE_GUARDRAILS_MAX_TIME_MS`
@@ -493,8 +527,8 @@ Key patterns:
 
 Snapshots:
 
-- runtime snapshots persist short-term context + guardrail state;
-- on next run with same `session_id`, runtime can resume safely.
+- runtime snapshots persist short-term memory context;
+- guardrail counters are reset for each new run and are not restored from previous requests.
 
 ### Cache backplane
 
@@ -582,55 +616,137 @@ with redaction and `MAX_CHARS` truncation.
 
 ## 11) Extending the Framework
 
-### 11.1 Add a new tool
+### 11.1 Control the pipeline loop without rewriting it
+
+You can safely control behavior at three levels:
+
+1. Stage-level (`stages.PipelineMutation`)
+- reorder/insert/replace/remove stages.
+
+2. Phase-level (`core.InterceptorRegistry`)
+- add deterministic business logic before/after a phase (`INPUT`, `ENRICH_CONTEXT`, `STOP_CHECK`, etc.).
+
+3. Tool-level (`ToolExecutionInterceptor`)
+- block/rewrite/fallback tool calls in one centralized place.
+
+### 11.2 Stage-level control (pipeline mutations)
+
+```go
+pipeline, err := stages.BuildDefaultPipeline(
+    stages.FactoryConfig{},
+    stages.InsertBefore("plan", myBusinessStage{}),
+    stages.InsertAfter("reflect", myAuditStage{}),
+)
+```
+
+Use stage mutations when you need explicit structural changes in stage order.
+
+### 11.3 Phase-level control (deterministic business logic)
+
+```go
+type PolicyInterceptor struct{}
+
+func (PolicyInterceptor) Name() string { return "policy" }
+func (PolicyInterceptor) BeforePhase(ctx context.Context, run *core.RunContext, phase core.Phase) error {
+    if phase == core.PhaseStopCheck && shouldForceStop(run) {
+        run.PendingStop = true
+        run.PendingStopReason = "business_policy_stop"
+    }
+    return nil
+}
+func (PolicyInterceptor) AfterPhase(context.Context, *core.RunContext, core.Phase, error) error { return nil }
+
+interceptors := core.NewInterceptorRegistry()
+interceptors.RegisterInterceptor(core.PhaseEnrichContext, PolicyInterceptor{})
+```
+
+Use phase interceptors for:
+
+- deterministic context enrichment;
+- stop-condition overrides;
+- policy checks before LLM decision;
+- state rewrites between iterations.
+
+### 11.4 Tool execution control in one place
+
+`ToolExecutor` is the single execution gateway. The default implementation delegates to `pkg/tools.Registry` (allow/deny policy, schema validation, timeout, retries, cache, dedup, logging), and additionally supports around-execution interceptors.
+
+```go
+type BlockDangerousWrites struct{}
+
+func (BlockDangerousWrites) Name() string { return "block_writes" }
+func (BlockDangerousWrites) AroundToolExecution(
+    ctx context.Context,
+    run *core.RunContext,
+    call core.ToolCall,
+    next core.ToolExecutionFunc,
+) (core.ToolResult, error) {
+    if call.Name == "crm.delete_customer" {
+        return core.ToolResult{}, fmt.Errorf("tool blocked by business policy")
+    }
+    return next(ctx, run, call)
+}
+```
+
+### 11.5 Deterministic MCP enrichment before planner decision
+
+Built-in example: `core.MCPContextEnrichment` runs in `ENRICH_CONTEXT` phase and injects outputs into `RunContext.State.Context`.
+
+Runtime wiring:
+
+```go
+interceptors := core.NewInterceptorRegistry()
+interceptors.RegisterInterceptor(
+    core.PhaseEnrichContext,
+    core.NewMCPContextEnrichment(resolved.MCPEnrichmentSources),
+)
+toolExecutor := core.NewRegistryToolExecutor(toolRegistry, interceptors)
+```
+
+Config:
+
+- `AGENT_CORE_AGENT_MCP_ENRICHMENT_SOURCES` (JSON array)
+- each entry: `name`, `tool_name`, `args`, `required`
+
+### 11.6 Add a reusable tool in `pkg/tools` (shared library)
 
 Steps:
 
 1. Implement `tools.Tool`.
-2. (Optional) Implement `RetryPolicy` and `CachePolicy`.
-3. Register tool in `buildRuntime` or inside a skill.
-4. Add tool name to `AGENT_CORE_TOOLS_ALLOWLIST`.
+2. (Optional) implement `RetryPolicy` and `CachePolicy`.
+3. Register in runtime wiring or inside a skill.
+4. Add tool to `AGENT_CORE_TOOLS_ALLOWLIST`.
 
-Example:
+### 11.7 Add a private business tool in `internal/*` (project-specific)
+
+Use this when the tool contains private adapters/domain logic that should not become reusable package API.
+
+Suggested layout:
+
+```text
+internal/
+  support/
+    tools/
+      ticket_create.go
+```
+
+Register it in runtime wiring (`cmd/agent-core/runtime.go`):
 
 ```go
-type CRMGetCustomerTool struct {
-    client *crm.Client
-}
-
-func (t *CRMGetCustomerTool) Name() string { return "crm.get_customer" }
-func (t *CRMGetCustomerTool) Description() string { return "Reads customer profile by id" }
-func (t *CRMGetCustomerTool) InputSchema() string {
-    return `{"type":"object","required":["customer_id"],"properties":{"customer_id":{"type":"string","minLength":1}},"additionalProperties":false}`
-}
-func (t *CRMGetCustomerTool) OutputSchema() string {
-    return `{"type":"object","required":["customer_id","tier","status"],"properties":{"customer_id":{"type":"string"},"tier":{"type":"string"},"status":{"type":"string"}},"additionalProperties":true}`
-}
-func (t *CRMGetCustomerTool) IsReadOnly() bool  { return true }
-func (t *CRMGetCustomerTool) IsSafeRetry() bool { return true }
-
-func (t *CRMGetCustomerTool) Execute(ctx context.Context, args json.RawMessage) (tools.ToolResult, error) {
-    var in struct {
-        CustomerID string `json:"customer_id"`
-    }
-    if err := json.Unmarshal(args, &in); err != nil {
-        return tools.ToolResult{}, err
-    }
-    profile, err := t.client.GetCustomer(ctx, in.CustomerID)
-    if err != nil {
-        return tools.ToolResult{}, err
-    }
-    raw, err := json.Marshal(profile)
-    if err != nil {
-        return tools.ToolResult{}, err
-    }
-    return tools.ToolResult{Output: string(raw)}, nil
+ticketTool := supporttools.NewTicketCreateTool(ticketClient)
+if err := toolRegistry.Register(ticketTool); err != nil {
+    return nil, err
 }
 ```
 
-### 11.2 Add a new skill
+This keeps architecture clean:
 
-A `skill` = tool package + prompt additions.
+- domain-specific code remains private in `internal/*`;
+- core loop, phase control, and tool execution contracts stay unchanged.
+
+### 11.8 Add a new skill
+
+A `skill` = tool package + prompt additions + optional pipeline mutations.
 
 ```go
 type SupportSkill struct{}
@@ -642,9 +758,7 @@ func (s *SupportSkill) Register(reg *tools.Registry) error {
     return nil
 }
 func (s *SupportSkill) PromptAdditions() []string {
-    return []string{
-        "Skill support enabled: verify customer status before creating any ticket.",
-    }
+    return []string{"Skill support enabled: verify customer status before creating any ticket."}
 }
 ```
 
@@ -653,19 +767,15 @@ Then:
 1. `skillRegistry.Register(&SupportSkill{})`
 2. `AGENT_CORE_SKILLS=ops,support`
 
-### 11.3 Connect MCP tools
+### 11.9 Connect MCP tools
 
 1. Enable `AGENT_CORE_MCP_ENABLED=true`
 2. Configure `AGENT_CORE_MCP_SERVERS`
 3. (Optional) provide tokens via `MCP_TOKEN_<SERVER>`
 
-After import, tools are available as:
+After import, tools are available as `mcp.<server>.<tool>`.
 
-- `mcp.<server>.<tool>`
-
-### 11.4 Final response contract (JSON Schema)
-
-Enforce strict structured final responses:
+### 11.10 Final response contract (JSON Schema)
 
 ```powershell
 $env:AGENT_CORE_OUTPUT_JSON_SCHEMA='{"type":"object","required":["answer","confidence"],"properties":{"answer":{"type":"string"},"confidence":{"type":"number","minimum":0,"maximum":1}},"additionalProperties":false}'
@@ -675,6 +785,157 @@ If final output is invalid:
 
 - agent retries up to `AGENT_CORE_OUTPUT_VALIDATION_RETRIES`;
 - a system correction prompt is added to memory to force a compliant final response.
+
+### 11.11 Internal incident-response bundle (real business case)
+
+The repository now includes a concrete private business implementation under `internal/*`: an incident-response/NOC agent bundle.
+It is opt-in and enabled by `AGENT_CORE_BUNDLE_ENABLED=true` (historical env name preserved for compatibility).
+
+Current structure:
+
+```text
+internal/
+  bundle.go
+  tools/
+    service_lookup_tool.go
+    runbook_lookup_tool.go
+    oncall_lookup_tool.go
+    incident_create_tool.go
+    incident_update_tool.go
+    incident_status_tool.go
+    incident_store.go
+  skills/
+    incident_ops_skill.go
+  pipeline/
+    input_sanitizer.go
+    input_gate_stage.go
+    post_reflect_audit_stage.go
+    pipeline_mutations.go
+  interceptors/
+    normalize_trace_interceptor.go
+    context_enrichment_interceptor.go
+    after_tool_execution_state_interceptor.go
+    stop_policy_interceptor.go
+    finalize_trace_interceptor.go
+    tool_policy_interceptor.go
+    tool_rewrite_interceptor.go
+    tool_fallback_interceptor.go
+```
+
+Runtime wiring when bundle is enabled (`cmd/agent-core/runtime.go`):
+
+- registers private tools and appends them to tool allowlist automatically;
+- registers private phase interceptors and tool execution interceptors;
+- injects private pipeline mutations (`sanitize`, `_input_gate`, `_post_reflect_audit`);
+- registers internal skill `incident_ops` in shared skill registry (activate via `AGENT_CORE_SKILLS`);
+- appends deterministic prompt hints for incident workflows.
+
+Business tools in this bundle:
+
+- read-only triage tools:
+  - `.service.lookup` (service metadata, owner team, runbook, dependencies, default severity)
+  - `.runbook.lookup` (scenario-specific runbook steps + verification checklist)
+  - `.oncall.lookup` (primary/secondary escalation contacts)
+  - `.incident.status` (current incident state + timeline summary)
+- mutating orchestration tools:
+  - `.incident.create` (create incident, derive defaults, initialize timeline)
+  - `.incident.update` (status transitions, note/next_action, assignee changes)
+
+Deterministic controls included:
+
+- input control: sanitizer + blocked-phrase gate before planning;
+- context enrichment: incident intent/severity inference, session-state snapshot hints, optional MCP capability hints;
+- tool governance: deny/prefix policy, argument rewrites, deterministic fallback payloads for selected read-only failures;
+- stop/finalize control: iteration cap + final trace markers.
+
+Recommended env for this business case:
+
+```powershell
+$env:AGENT_CORE_BUNDLE_ENABLED="true"
+$env:AGENT_CORE_SKILLS="ops,incident_ops"
+$env:AGENT_CORE_TOOLS_ALLOWLIST="time.now,kv.put,kv.get,http.get,.service.lookup,.runbook.lookup,.oncall.lookup,.incident.create,.incident.update,.incident.status"
+```
+
+Notes:
+
+- private bundle tools are auto-appended to allowlist when enabled, so explicit listing is optional but recommended for audit clarity;
+- `incident_ops` is guidance-focused (prompt additions), while domain logic and side effects stay in `internal/tools`;
+- this is a real reference implementation, not placeholder `example_*` stubs.
+
+### 11.12 Build your own internal bundle (detailed playbook)
+
+Use this sequence to implement your own business case without changing core runtime contracts.
+
+1. Define domain boundaries first.
+- List entities, mutable operations, and irreversible side effects.
+- Classify each operation as read-only or mutating.
+- Decide which failures must hard-fail and which may degrade.
+
+2. Model private domain data in `internal/*`.
+- Implement deterministic adapters/stores first (service clients, repositories, fixtures for tests).
+- Keep business API private; avoid leaking it into reusable `pkg/*`.
+
+3. Implement tools with strict schemas.
+- Each tool implements `tools.Tool` with explicit JSON input/output schema.
+- Add `RetryPolicy` intentionally (`IsReadOnly`, `IsSafeRetry`).
+- Add `CachePolicy` only for genuinely stable read paths.
+
+4. Add a domain skill for planning guidance.
+- Implement `skills.Skill` in `internal/skills`.
+- Keep side effects in tools; use skill for planner hints and workflow guidance.
+- Activate through `AGENT_CORE_SKILLS` exactly like standard reusable skills.
+
+5. Add pipeline mutations only for structural stage changes.
+- Use `stages.InsertBefore/After`, `Replace`, `Remove` for topology changes.
+- Keep custom stages deterministic and cheap; avoid network I/O there.
+
+6. Add phase interceptors for deterministic policies.
+- `ENRICH_CONTEXT`: inject private context and retrieved docs.
+- `AFTER_TOOL_EXECUTION`: derive compact state for next planner step.
+- `STOP_CHECK` and `FINALIZE`: enforce business stop rules and diagnostics.
+
+7. Add tool execution interceptors for centralized governance.
+- Policy interceptor: block tool names/prefixes.
+- Rewrite interceptor: normalize/fill args before execution.
+- Fallback interceptor: return deterministic safe payloads for selected read-only failures.
+
+8. Aggregate everything in one bundle object.
+- Expose `RegisterTools`, `RegisterSkills`, `RegisterInterceptors`, `PipelineMutations`, `PromptAdditions`.
+- Keep runtime wiring composable and minimal.
+
+Reference skeleton:
+
+```go
+type Bundle struct {
+    Tools  []tools.Tool
+    Skills []skills.Skill
+}
+
+func NewBundle() *Bundle { /* build domain components */ }
+func (b *Bundle) RegisterTools(reg *tools.Registry) error { /* ... */ }
+func (b *Bundle) RegisterSkills(reg *skills.Registry) error { /* ... */ }
+func (b *Bundle) RegisterInterceptors(ir *core.InterceptorRegistry) { /* ... */ }
+func (b *Bundle) PipelineMutations() []stages.PipelineMutation { /* ... */ }
+func (b *Bundle) PromptAdditions() []string { /* ... */ }
+```
+
+9. Wire the bundle behind one feature flag in `cmd/agent-core/runtime.go`.
+- Instantiate only when the flag is enabled.
+- Register/apply skills, then register tools/interceptors.
+- Merge prompt additions and pipeline mutations into runtime config.
+
+10. Configure env explicitly.
+- Enable bundle: `AGENT_CORE_BUNDLE_ENABLED=true`.
+- Enable skills: `AGENT_CORE_SKILLS=ops,<your_skill>`.
+- Keep explicit tool allowlist and per-tool error policy.
+- Tune guardrails and output schema to downstream contract.
+
+11. Build a rollout test matrix.
+- Unit tests per tool (schema, happy path, edge cases, retry/cache flags).
+- Unit tests for interceptors and pipeline mutations.
+- Runtime integration tests for end-to-end flow and stop reasons.
+- HTTP contract tests for `/v1/agent/run`.
+- Negative tests for blocked input, blocked tools, fallback branches, and mutating tool failure behavior.
 
 ---
 
@@ -849,15 +1110,13 @@ go tool cover -func=coverage.out
 
 Useful test packages:
 
-- `internal/agent/*_test.go` — agent lifecycle, tool-error policy, snapshot restore.
-- `internal/planner/planner_test.go` — JSON retries and tool-selection policy.
-- `internal/tools/*_test.go` — allowlist/security/retry/cache/dedup.
-- `internal/llm/*_test.go` — provider cache/stream/token metrics.
+- `core/pipeline_test.go` — stage ordering and pipeline mutation behavior.
+- `pkg/stages/*_test.go` — isolated stage tests and extensible stage ordering.
+- `pkg/planner/*_test.go` — JSON retries and tool-selection policy.
+- `pkg/tools/*_test.go` — allowlist/security/retry/cache/dedup.
+- `pkg/llm/*_test.go` — provider cache/stream/token metrics.
+- `pkg/telemetry/*_test.go` — context propagation and telemetry backend behavior.
 - `cmd/agent-core/server_test.go` — HTTP contract and first-only behavior.
-
-Golden fixture for stable runtime contract:
-
-- `internal/agent/testdata/run_result.golden.json`
 
 ---
 
