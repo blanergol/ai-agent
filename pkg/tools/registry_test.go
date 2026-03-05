@@ -358,6 +358,29 @@ func TestRegistryDoesNotRetryNonRetryableErrors(t *testing.T) {
 	}
 }
 
+// TestRegistryExposesToolMutability проверяет доступность mutability-метаданных для approval слоя.
+func TestRegistryExposesToolMutability(t *testing.T) {
+	reg := NewRegistry(RegistryConfig{DefaultTimeout: time.Second}, slog.Default())
+	ro := &cachedReadOnlyTool{name: "read.tool", ttl: time.Second}
+	mut := &testTool{name: "mut.tool"}
+	if err := reg.Register(ro); err != nil {
+		t.Fatalf("register read-only tool: %v", err)
+	}
+	if err := reg.Register(mut); err != nil {
+		t.Fatalf("register mutating tool: %v", err)
+	}
+
+	readOnly, known := reg.IsReadOnlyTool("read.tool")
+	if !known || !readOnly {
+		t.Fatalf("read.tool readOnly=%t known=%t, want true true", readOnly, known)
+	}
+
+	readOnly, known = reg.IsReadOnlyTool("mut.tool")
+	if !known || readOnly {
+		t.Fatalf("mut.tool readOnly=%t known=%t, want false true", readOnly, known)
+	}
+}
+
 // TestRegistryCachesReadOnlyTools проверяет общий read-only кэш для повторных одинаковых вызовов.
 func TestRegistryCachesReadOnlyTools(t *testing.T) {
 	reg := NewRegistry(RegistryConfig{

@@ -19,6 +19,11 @@ type ToolRegistry interface {
 	Execute(ctx context.Context, name string, args json.RawMessage) (ToolResult, error)
 }
 
+// ToolMutabilityInspector предоставляет информацию о mutating/read-only семантике инструмента.
+type ToolMutabilityInspector interface {
+	IsReadOnlyTool(name string) (readOnly bool, known bool)
+}
+
 // Memory is a run-scoped memory contract.
 type Memory interface {
 	NewRun() Memory

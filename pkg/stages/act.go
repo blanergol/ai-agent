@@ -63,6 +63,26 @@ func (s *ActStage) Run(ctx context.Context, run *core.RunContext) (core.StageRes
 		run.ActionDone = true
 		return core.Continue(), nil
 	case core.ActionTypeTool:
+		if shouldRequireHumanApproval(run, action) && !run.SkipApprovalOnce {
+			run.PendingApproval = core.NewPendingToolApproval(
+				run.Meta.SessionID,
+				run.CurrentStep,
+				action,
+				run.NextAction.Done,
+				"Mutating tool call requires human approval before execution.",
+			)
+			run.PendingStop = true
+			run.PendingStopReason = core.StopReasonAwaitingHumanApproval
+			run.PendingFinalResponse = fmt.Sprintf(
+				"Tool %q requires approval before execution. request_id=%s",
+				strings.TrimSpace(action.ToolName),
+				run.PendingApproval.RequestID,
+			)
+			run.ActionResult = run.PendingFinalResponse
+			run.ActionDone = true
+			return core.Continue(), nil
+		}
+		run.SkipApprovalOnce = false
 		if err := run.ExecutePhase(ctx, core.PhaseBeforeToolExecution, nil); err != nil {
 			return core.StageResult{}, err
 		}
@@ -137,4 +157,35 @@ func (s *ActStage) Run(ctx context.Context, run *core.RunContext) (core.StageRes
 			false,
 		)
 	}
+}
+
+func shouldRequireHumanApproval(run *core.RunContext, action core.Action) bool {
+	if run == nil {
+		return false
+	}
+	if action.Type != core.ActionTypeTool {
+		return false
+	}
+	if !run.Config.RequireToolApproval {
+		return false
+	}
+	toolName := strings.TrimSpace(action.ToolName)
+	if toolName == "" {
+		return false
+	}
+	for _, exempt := range run.Config.ToolApprovalAutoApprove {
+		if strings.EqualFold(strings.TrimSpace(exempt), toolName) {
+			return false
+		}
+	}
+	inspector, ok := run.Deps.Tools.(core.ToolMutabilityInspector)
+	if !ok {
+		// Без mutability-метаданных по умолчанию требуем explicit approval.
+		return true
+	}
+	readOnly, known := inspector.IsReadOnlyTool(toolName)
+	if !known {
+		return true
+	}
+	return !readOnly
 }

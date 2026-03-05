@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/blanergol/agent-core/config"
@@ -47,7 +49,7 @@ func BuildRuntime(ctx context.Context, overrides Overrides) (*Runtime, error) {
 
 	logger := buildLogger(resolved.LoggerDebug)
 
-	store, err := state.NewKVStore(resolved.StatePersistPath)
+	store, stateCloser, err := buildStateStore(resolved.StatePersistPath)
 	if err != nil {
 		return nil, err
 	}
@@ -67,9 +69,14 @@ func BuildRuntime(ctx context.Context, overrides Overrides) (*Runtime, error) {
 		return nil, err
 	}
 
+	longTerm, longTermCloser, err := buildLongTermMemory(resolved.StatePersistPath)
+	if err != nil {
+		return nil, err
+	}
+
 	mem := memory.NewManagerWithOptions(
 		memory.NewShortTermMemory(resolved.Memory.ShortTermMaxMessages),
-		memory.NewInMemoryLongTerm(),
+		longTerm,
 		resolved.Memory.RecallTopK,
 		resolved.Memory.TokenBudget,
 	)
@@ -205,6 +212,12 @@ func BuildRuntime(ctx context.Context, overrides Overrides) (*Runtime, error) {
 	tracer := telemetry.CombineTracers(telemetryTracers...)
 	artifacts := telemetry.CombineArtifactSinks(artifactSinks...)
 	scores := telemetry.CombineScoreSinks(scoreSinks...)
+	if stateCloser != nil {
+		shutdownFuncs = append(shutdownFuncs, stateCloser)
+	}
+	if longTermCloser != nil {
+		shutdownFuncs = append(shutdownFuncs, longTermCloser)
+	}
 	shutdown := telemetry.JoinShutdownFuncs(shutdownFuncs...)
 	metrics := telemetry.NoopMetrics{}
 
@@ -260,6 +273,51 @@ func BuildRuntime(ctx context.Context, overrides Overrides) (*Runtime, error) {
 		WebUIEnabled:   resolved.WebUIEnabled,
 		Shutdown:       shutdown,
 	}, nil
+}
+
+func buildStateStore(persistPath string) (state.Store, func(context.Context) error, error) {
+	path := strings.TrimSpace(persistPath)
+	if path == "" {
+		store, err := state.NewKVStore("")
+		return store, nil, err
+	}
+	if strings.EqualFold(filepath.Ext(path), ".json") {
+		store, err := state.NewKVStore(path)
+		return store, nil, err
+	}
+	store, err := state.NewSQLiteStore(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return store, func(context.Context) error {
+		return store.Close()
+	}, nil
+}
+
+func buildLongTermMemory(statePersistPath string) (memory.LongTermMemory, func(context.Context) error, error) {
+	path := deriveMemoryPath(statePersistPath)
+	if path == "" {
+		return memory.NewInMemoryLongTerm(), nil, nil
+	}
+	backend, err := memory.NewSQLiteLongTerm(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return backend, func(context.Context) error {
+		return backend.Close()
+	}, nil
+}
+
+func deriveMemoryPath(statePersistPath string) string {
+	path := strings.TrimSpace(statePersistPath)
+	if path == "" {
+		return ""
+	}
+	ext := strings.ToLower(strings.TrimSpace(filepath.Ext(path)))
+	if ext == ".json" {
+		return strings.TrimSuffix(path, filepath.Ext(path)) + ".memory.sqlite"
+	}
+	return path
 }
 
 func buildLogger(debug bool) *slog.Logger {

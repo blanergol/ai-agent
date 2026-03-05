@@ -20,6 +20,8 @@ func TestLoadFromEnvOverridesValues(t *testing.T) {
 	t.Setenv("AGENT_CORE_AGENT_TOOL_ERROR_MODE", "fail")
 	t.Setenv("AGENT_CORE_AGENT_TOOL_ERROR_FALLBACK", "http.get=continue")
 	t.Setenv("AGENT_CORE_AGENT_MAX_INPUT_CHARS", "4096")
+	t.Setenv("AGENT_CORE_AGENT_REQUIRE_TOOL_APPROVAL", "false")
+	t.Setenv("AGENT_CORE_AGENT_APPROVAL_AUTO_APPROVE_TOOLS", "kv.put,mcp.obs.readonly")
 	t.Setenv("AGENT_CORE_WEB_UI_ENABLED", "true")
 	t.Setenv("MCP_TOKEN_LOCAL", "tok")
 
@@ -60,6 +62,12 @@ func TestLoadFromEnvOverridesValues(t *testing.T) {
 	}
 	if cfg.Agent.ToolErrorFallback["http.get"] != "continue" {
 		t.Fatalf("tool_error_fallback[http.get] = %s", cfg.Agent.ToolErrorFallback["http.get"])
+	}
+	if cfg.Agent.RequireToolApproval {
+		t.Fatalf("require_tool_approval = %t, want false", cfg.Agent.RequireToolApproval)
+	}
+	if len(cfg.Agent.ApprovalAutoApproveTools) != 2 {
+		t.Fatalf("approval_auto_approve_tools len = %d, want 2", len(cfg.Agent.ApprovalAutoApproveTools))
 	}
 	if !cfg.WebUI.Enabled {
 		t.Fatalf("web_ui.enabled = %t, want true", cfg.WebUI.Enabled)
@@ -352,6 +360,9 @@ func TestResolveRuntimeAppliesOverrides(t *testing.T) {
 	}
 	if resolved.ToolRegistry.DefaultTimeout <= 0 {
 		t.Fatalf("tool default timeout = %s, want > 0", resolved.ToolRegistry.DefaultTimeout)
+	}
+	if !resolved.Runtime.RequireToolApproval {
+		t.Fatalf("require_tool_approval = %t, want true", resolved.Runtime.RequireToolApproval)
 	}
 }
 

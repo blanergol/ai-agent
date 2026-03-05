@@ -214,6 +214,56 @@ const webUIPage = `<!doctype html>
     .status.done strong { color: var(--ok); }
     .status.error strong { color: var(--err); }
 
+    .approval {
+      border: 1px solid #d8cda3;
+      border-radius: 12px;
+      padding: 12px;
+      background: #fff9e8;
+      display: grid;
+      gap: 8px;
+      color: #5b4510;
+    }
+
+    .approval[hidden] {
+      display: none;
+    }
+
+    .approval-head {
+      font-size: 12px;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+
+    .approval-tool {
+      font-weight: 600;
+      color: #3f2f0a;
+    }
+
+    .approval pre {
+      margin: 0;
+      padding: 10px;
+      border-radius: 10px;
+      border: 1px solid #e0d5b5;
+      background: #fffef9;
+      font-size: 12px;
+      line-height: 1.42;
+      max-height: 180px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .approval-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .btn-secondary {
+      background: linear-gradient(180deg, #8a5d00, #6f4a00);
+    }
+
     @media (max-width: 640px) {
       body { padding: 12px; }
       .app { padding: 12px; }
@@ -222,6 +272,9 @@ const webUIPage = `<!doctype html>
       }
       button {
         width: 100%;
+      }
+      .approval-actions {
+        grid-template-columns: 1fr;
       }
       .chat { min-height: 200px; }
     }
@@ -239,6 +292,18 @@ const webUIPage = `<!doctype html>
         <button type="submit" id="send-btn">Отправить</button>
       </div>
     </form>
+
+    <section id="approval-box" class="approval" hidden>
+      <div class="approval-head">Требуется подтверждение действия</div>
+      <div class="approval-tool" id="approval-tool">-</div>
+      <div id="approval-reason"></div>
+      <pre id="approval-args">{}</pre>
+      <textarea id="approval-comment" placeholder="Комментарий к approve/deny (опционально)"></textarea>
+      <div class="approval-actions">
+        <button type="button" id="approval-approve">Approve</button>
+        <button type="button" id="approval-deny" class="btn-secondary">Deny</button>
+      </div>
+    </section>
 
     <div id="status" class="status idle">
       <div class="status-head">
@@ -259,11 +324,32 @@ const webUIPage = `<!doctype html>
     const statusTitleEl = document.getElementById("status-title");
     const statusDetailsEl = document.getElementById("status-details");
     const statusExtraEl = document.getElementById("status-extra");
+    const approvalBox = document.getElementById("approval-box");
+    const approvalToolEl = document.getElementById("approval-tool");
+    const approvalReasonEl = document.getElementById("approval-reason");
+    const approvalArgsEl = document.getElementById("approval-args");
+    const approvalCommentEl = document.getElementById("approval-comment");
+    const approvalApproveBtn = document.getElementById("approval-approve");
+    const approvalDenyBtn = document.getElementById("approval-deny");
+
+    let currentSessionID = "";
+    let pendingApproval = null;
 
     const clearNode = (node) => {
       while (node.firstChild) {
         node.removeChild(node.firstChild);
       }
+    };
+
+    const addMessage = (role, text) => {
+      if (emptyChat) {
+        emptyChat.remove();
+      }
+      const node = document.createElement("div");
+      node.className = "message " + role;
+      node.textContent = text;
+      chat.appendChild(node);
+      chat.scrollTop = chat.scrollHeight;
     };
 
     const renderStatusSection = (title, values) => {
@@ -312,7 +398,6 @@ const webUIPage = `<!doctype html>
         statusExtraEl.hidden = true;
         return;
       }
-
       const planningSteps = Array.isArray(meta.planningSteps)
         ? meta.planningSteps.map((step, index) => formatPlanningStep(step, index))
         : [];
@@ -339,20 +424,112 @@ const webUIPage = `<!doctype html>
       }
     };
 
-    const addMessage = (role, text) => {
-      if (emptyChat) {
-        emptyChat.remove();
+    const setComposerDisabled = (disabled) => {
+      sendBtn.disabled = disabled;
+      promptEl.disabled = disabled;
+    };
+
+    const setApprovalDisabled = (disabled) => {
+      approvalApproveBtn.disabled = disabled;
+      approvalDenyBtn.disabled = disabled;
+      approvalCommentEl.disabled = disabled;
+    };
+
+    const renderApproval = (approval) => {
+      pendingApproval = approval || null;
+      if (!approval) {
+        approvalBox.hidden = true;
+        approvalToolEl.textContent = "-";
+        approvalReasonEl.textContent = "";
+        approvalArgsEl.textContent = "{}";
+        approvalCommentEl.value = "";
+        setApprovalDisabled(false);
+        return;
       }
-      const node = document.createElement("div");
-      node.className = "message " + role;
-      node.textContent = text;
-      chat.appendChild(node);
-      chat.scrollTop = chat.scrollHeight;
+      const action = approval.action && typeof approval.action === "object" ? approval.action : {};
+      const toolName = typeof action.tool_name === "string" ? action.tool_name : "(unknown tool)";
+      const args = action.tool_args === undefined ? {} : action.tool_args;
+      const reason = typeof approval.reason === "string" && approval.reason
+        ? approval.reason
+        : "Mutating tool call requires human approval.";
+      approvalToolEl.textContent = "Tool: " + toolName + ", request_id=" + (approval.request_id || "-");
+      approvalReasonEl.textContent = reason;
+      try {
+        approvalArgsEl.textContent = JSON.stringify(args, null, 2);
+      } catch (_err) {
+        approvalArgsEl.textContent = String(args);
+      }
+      approvalCommentEl.value = "";
+      approvalBox.hidden = false;
+      setApprovalDisabled(false);
+    };
+
+    const parseResponse = async (response) => {
+      const raw = await response.text();
+      let payload = null;
+      try {
+        payload = raw ? JSON.parse(raw) : null;
+      } catch (_err) {
+        payload = null;
+      }
+      return { raw, payload };
+    };
+
+    const runRequest = async (body, options = {}) => {
+      const startedAt = performance.now();
+      try {
+        const response = await fetch("/v1/agent/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        const parsed = await parseResponse(response);
+        const elapsedMs = Math.round(performance.now() - startedAt);
+
+        if (!response.ok) {
+          const errorText = parsed.payload && parsed.payload.error ? parsed.payload.error : (parsed.raw || "unknown error");
+          addMessage("agent", "Ошибка: " + errorText);
+          setStatus("error", "HTTP " + response.status + ", " + elapsedMs + "ms, message=" + errorText);
+          return;
+        }
+
+        const payload = parsed.payload || {};
+        if (typeof payload.session_id === "string" && payload.session_id) {
+          currentSessionID = payload.session_id;
+        }
+
+        const finalResponse = typeof payload.final_response === "string" ? payload.final_response : "";
+        addMessage("agent", finalResponse || "(пустой ответ)");
+
+        const steps = Number.isInteger(payload.steps) ? payload.steps : "-";
+        const toolCalls = Number.isInteger(payload.tool_calls) ? payload.tool_calls : "-";
+        const stopReason = payload.stop_reason ? payload.stop_reason : "-";
+        const sessionID = payload.session_id ? payload.session_id : "-";
+        const correlationID = payload.correlation_id ? payload.correlation_id : "-";
+        const planningSteps = Array.isArray(payload.planning_steps) ? payload.planning_steps : [];
+        const calledTools = Array.isArray(payload.called_tools) ? payload.called_tools.filter((item) => typeof item === "string") : [];
+        const mcpTools = Array.isArray(payload.mcp_tools) ? payload.mcp_tools.filter((item) => typeof item === "string") : [];
+        const skills = Array.isArray(payload.skills) ? payload.skills.filter((item) => typeof item === "string") : [];
+
+        const approval = payload.pending_approval && typeof payload.pending_approval === "object" ? payload.pending_approval : null;
+        renderApproval(approval);
+
+        const extra = approval ? ", approval=requested" : "";
+        setStatus(
+          "done",
+          "HTTP " + response.status + ", " + elapsedMs + "ms, steps=" + steps + ", tool_calls=" + toolCalls + ", stop=" + stopReason + ", session=" + sessionID + ", correlation=" + correlationID + extra,
+          { planningSteps, calledTools, mcpTools, skills }
+        );
+      } catch (error) {
+        const elapsedMs = Math.round(performance.now() - startedAt);
+        const msg = error instanceof Error ? error.message : "network error";
+        addMessage("agent", "Ошибка сети: " + msg);
+        setStatus("error", String(elapsedMs) + "ms, network=" + msg);
+      }
     };
 
     const promptMinHeight = Number.parseFloat(getComputedStyle(promptEl).minHeight) || 48;
     const promptMaxHeight = Number.parseFloat(getComputedStyle(promptEl).maxHeight) || 240;
-
     const autoResize = () => {
       promptEl.style.height = "0px";
       const contentHeight = promptEl.scrollHeight;
@@ -360,7 +537,6 @@ const webUIPage = `<!doctype html>
       promptEl.style.height = String(nextHeight) + "px";
       promptEl.style.overflowY = contentHeight > promptMaxHeight ? "auto" : "hidden";
     };
-
     promptEl.addEventListener("input", autoResize);
     autoResize();
 
@@ -371,71 +547,52 @@ const webUIPage = `<!doctype html>
         setStatus("error", "пустой запрос: введите текст перед отправкой");
         return;
       }
-
       addMessage("user", input);
       setStatus("running", "POST /v1/agent/run");
-      sendBtn.disabled = true;
-      promptEl.disabled = true;
+      setComposerDisabled(true);
 
-      const startedAt = performance.now();
-      try {
-        const response = await fetch("/v1/agent/run", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({ input })
-        });
-
-        const raw = await response.text();
-        let payload = null;
-        try {
-          payload = raw ? JSON.parse(raw) : null;
-        } catch (_err) {
-          payload = null;
-        }
-
-        const elapsedMs = Math.round(performance.now() - startedAt);
-        if (!response.ok) {
-          const errorText = payload && payload.error ? payload.error : (raw || "unknown error");
-          addMessage("agent", "Ошибка: " + errorText);
-          setStatus("error", "HTTP " + response.status + ", " + elapsedMs + "ms, message=" + errorText);
-          return;
-        }
-
-        const finalResponse = payload && typeof payload.final_response === "string" ? payload.final_response : "";
-        addMessage("agent", finalResponse || "(пустой ответ)");
-        const steps = payload && Number.isInteger(payload.steps) ? payload.steps : "-";
-        const toolCalls = payload && Number.isInteger(payload.tool_calls) ? payload.tool_calls : "-";
-        const stopReason = payload && payload.stop_reason ? payload.stop_reason : "-";
-        const sessionID = payload && payload.session_id ? payload.session_id : "-";
-        const correlationID = payload && payload.correlation_id ? payload.correlation_id : "-";
-        const planningSteps = payload && Array.isArray(payload.planning_steps) ? payload.planning_steps : [];
-        const calledTools = payload && Array.isArray(payload.called_tools) ? payload.called_tools.filter((item) => typeof item === "string") : [];
-        const mcpTools = payload && Array.isArray(payload.mcp_tools) ? payload.mcp_tools.filter((item) => typeof item === "string") : [];
-        const skills = payload && Array.isArray(payload.skills) ? payload.skills.filter((item) => typeof item === "string") : [];
-        setStatus(
-          "done",
-          "HTTP " + response.status + ", " + elapsedMs + "ms, steps=" + steps + ", tool_calls=" + toolCalls + ", stop=" + stopReason + ", session=" + sessionID + ", correlation=" + correlationID,
-          {
-            planningSteps,
-            calledTools,
-            mcpTools,
-            skills
-          }
-        );
-      } catch (error) {
-        const elapsedMs = Math.round(performance.now() - startedAt);
-        const msg = error instanceof Error ? error.message : "network error";
-        addMessage("agent", "Ошибка сети: " + msg);
-        setStatus("error", String(elapsedMs) + "ms, network=" + msg);
-      } finally {
-        sendBtn.disabled = false;
-        promptEl.disabled = false;
-        promptEl.value = "";
-        autoResize();
-        promptEl.focus();
+      const body = { input };
+      if (currentSessionID) {
+        body.session_id = currentSessionID;
       }
+      await runRequest(body);
+
+      setComposerDisabled(false);
+      promptEl.value = "";
+      autoResize();
+      promptEl.focus();
+    });
+
+    const submitApproval = async (decision) => {
+      if (!pendingApproval || !pendingApproval.request_id) {
+        setStatus("error", "нет pending approval для подтверждения");
+        return;
+      }
+      if (!currentSessionID) {
+        setStatus("error", "неизвестен session_id для подтверждения");
+        return;
+      }
+      setApprovalDisabled(true);
+      addMessage("user", "Approval decision: " + decision + ", request_id=" + pendingApproval.request_id);
+      setStatus("running", "POST /v1/agent/run (approval)");
+
+      await runRequest({
+        input: "",
+        session_id: currentSessionID,
+        approval: {
+          request_id: pendingApproval.request_id,
+          decision,
+          comment: approvalCommentEl.value.trim()
+        }
+      });
+      setApprovalDisabled(false);
+    };
+
+    approvalApproveBtn.addEventListener("click", () => {
+      submitApproval("approve");
+    });
+    approvalDenyBtn.addEventListener("click", () => {
+      submitApproval("deny");
     });
   </script>
 </body>

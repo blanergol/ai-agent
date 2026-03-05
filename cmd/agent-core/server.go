@@ -37,24 +37,26 @@ type apiServer struct {
 }
 
 type runRequest struct {
-	Input         string `json:"input"`
-	UserSub       string `json:"user_sub,omitempty"`
-	SessionID     string `json:"session_id,omitempty"`
-	CorrelationID string `json:"correlation_id,omitempty"`
+	Input         string              `json:"input"`
+	UserSub       string              `json:"user_sub,omitempty"`
+	SessionID     string              `json:"session_id,omitempty"`
+	CorrelationID string              `json:"correlation_id,omitempty"`
+	Approval      *core.ApprovalInput `json:"approval,omitempty"`
 }
 
 type runResponse struct {
-	FinalResponse string              `json:"final_response"`
-	Steps         int                 `json:"steps"`
-	ToolCalls     int                 `json:"tool_calls"`
-	StopReason    string              `json:"stop_reason"`
-	SessionID     string              `json:"session_id"`
-	CorrelationID string              `json:"correlation_id"`
-	APIVersion    string              `json:"api_version"`
-	PlanningSteps []core.PlanningStep `json:"planning_steps,omitempty"`
-	CalledTools   []string            `json:"called_tools,omitempty"`
-	MCPTools      []string            `json:"mcp_tools,omitempty"`
-	Skills        []string            `json:"skills,omitempty"`
+	FinalResponse   string                    `json:"final_response"`
+	Steps           int                       `json:"steps"`
+	ToolCalls       int                       `json:"tool_calls"`
+	StopReason      string                    `json:"stop_reason"`
+	SessionID       string                    `json:"session_id"`
+	CorrelationID   string                    `json:"correlation_id"`
+	APIVersion      string                    `json:"api_version"`
+	PlanningSteps   []core.PlanningStep       `json:"planning_steps,omitempty"`
+	CalledTools     []string                  `json:"called_tools,omitempty"`
+	MCPTools        []string                  `json:"mcp_tools,omitempty"`
+	Skills          []string                  `json:"skills,omitempty"`
+	PendingApproval *core.PendingToolApproval `json:"pending_approval,omitempty"`
 }
 
 type errorResponse struct {
@@ -126,8 +128,12 @@ func (s *apiServer) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Input = strings.TrimSpace(req.Input)
-	if req.Input == "" {
+	if req.Input == "" && req.Approval == nil {
 		writeError(w, http.StatusBadRequest, "input is required")
+		return
+	}
+	if req.Approval != nil && strings.TrimSpace(req.SessionID) == "" {
+		writeError(w, http.StatusBadRequest, "session_id is required for approval decision")
 		return
 	}
 	if principal.Subject != "" {
@@ -158,6 +164,7 @@ func (s *apiServer) handleRun(w http.ResponseWriter, r *http.Request) {
 		SessionID:     req.SessionID,
 		CorrelationID: req.CorrelationID,
 		UserSub:       req.UserSub,
+		Approval:      req.Approval,
 	})
 	if err != nil {
 		if claimed {
@@ -172,19 +179,24 @@ func (s *apiServer) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, runResponse{
-		FinalResponse: result.FinalResponse,
-		Steps:         result.Steps,
-		ToolCalls:     result.ToolCalls,
-		StopReason:    result.StopReason,
-		SessionID:     result.SessionID,
-		CorrelationID: result.CorrelationID,
-		APIVersion:    result.APIVersion,
-		PlanningSteps: result.PlanningSteps,
-		CalledTools:   result.CalledTools,
-		MCPTools:      result.MCPTools,
-		Skills:        result.Skills,
+		FinalResponse:   result.FinalResponse,
+		Steps:           result.Steps,
+		ToolCalls:       result.ToolCalls,
+		StopReason:      result.StopReason,
+		SessionID:       result.SessionID,
+		CorrelationID:   result.CorrelationID,
+		APIVersion:      result.APIVersion,
+		PlanningSteps:   result.PlanningSteps,
+		CalledTools:     result.CalledTools,
+		MCPTools:        result.MCPTools,
+		Skills:          result.Skills,
+		PendingApproval: result.PendingApproval,
 	})
 
+	if claimed && strings.EqualFold(strings.TrimSpace(result.StopReason), core.StopReasonAwaitingHumanApproval) {
+		s.handled.Store(false)
+		claimed = false
+	}
 	if claimed && s.onFirstHandled != nil {
 		go s.onFirstHandled()
 	}

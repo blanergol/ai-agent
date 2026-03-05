@@ -21,21 +21,23 @@ type RunInput struct {
 	SessionID     string
 	CorrelationID string
 	UserSub       string
+	Approval      *ApprovalInput
 }
 
 // RunResult is the typed agent-run output.
 type RunResult struct {
-	FinalResponse string
-	Steps         int
-	ToolCalls     int
-	StopReason    string
-	SessionID     string
-	CorrelationID string
-	APIVersion    string
-	PlanningSteps []PlanningStep
-	CalledTools   []string
-	MCPTools      []string
-	Skills        []string
+	FinalResponse   string
+	Steps           int
+	ToolCalls       int
+	StopReason      string
+	SessionID       string
+	CorrelationID   string
+	APIVersion      string
+	PlanningSteps   []PlanningStep
+	CalledTools     []string
+	MCPTools        []string
+	Skills          []string
+	PendingApproval *PendingToolApproval
 }
 
 // PlanningStep describes one planner step in a run.
@@ -74,11 +76,19 @@ type GuardrailsSnapshot struct {
 
 // RuntimeSnapshot is serializable run snapshot for session resume.
 type RuntimeSnapshot struct {
-	APIVersion        string
-	SessionID         string
-	ShortTermMessages []Message
-	Guardrails        GuardrailsSnapshot
-	UpdatedAt         time.Time
+	APIVersion           string
+	SessionID            string
+	ShortTermMessages    []Message
+	Guardrails           GuardrailsSnapshot
+	PendingStop          bool
+	PendingStopReason    string
+	PendingFinalResponse string
+	PendingApproval      *PendingToolApproval
+	PlanningSteps        []PlanningStep
+	CalledTools          []string
+	StateContext         map[string]any
+	RetrievedDocs        []string
+	UpdatedAt            time.Time
 }
 
 // RunContext is mutable state shared between pipeline stages.
@@ -104,6 +114,12 @@ type RunContext struct {
 	PendingStop          bool
 	PendingStopReason    string
 	PendingFinalResponse string
+	PendingApproval      *PendingToolApproval
+
+	ResumeAction     *Action
+	ResumeActionDone bool
+	SkipApprovalOnce bool
+	Approval         *ApprovalInput
 
 	OutputValidationAttempts int
 
@@ -127,17 +143,18 @@ func (r *RunContext) BuildResult() RunResult {
 		stopReason = strings.TrimSpace(r.PendingStopReason)
 	}
 	return RunResult{
-		FinalResponse: strings.TrimSpace(r.FinalResponse),
-		Steps:         steps,
-		ToolCalls:     toolCalls,
-		StopReason:    stopReason,
-		SessionID:     r.Meta.SessionID,
-		CorrelationID: r.Meta.CorrelationID,
-		APIVersion:    APIVersion,
-		PlanningSteps: copyPlanningSteps(r.PlanningSteps),
-		CalledTools:   copyStrings(r.CalledTools),
-		MCPTools:      mcpToolsFrom(r.CalledTools),
-		Skills:        copyStrings(r.Config.EnabledSkills),
+		FinalResponse:   strings.TrimSpace(r.FinalResponse),
+		Steps:           steps,
+		ToolCalls:       toolCalls,
+		StopReason:      stopReason,
+		SessionID:       r.Meta.SessionID,
+		CorrelationID:   r.Meta.CorrelationID,
+		APIVersion:      APIVersion,
+		PlanningSteps:   copyPlanningSteps(r.PlanningSteps),
+		CalledTools:     copyStrings(r.CalledTools),
+		MCPTools:        mcpToolsFrom(r.CalledTools),
+		Skills:          copyStrings(r.Config.EnabledSkills),
+		PendingApproval: copyPendingApproval(r.PendingApproval),
 	}
 }
 
@@ -171,6 +188,15 @@ func copyPlanningSteps(values []PlanningStep) []PlanningStep {
 	out := make([]PlanningStep, len(values))
 	copy(out, values)
 	return out
+}
+
+func copyPendingApproval(value *PendingToolApproval) *PendingToolApproval {
+	if value == nil {
+		return nil
+	}
+	out := *value
+	out.Action.ToolArgs = append([]byte(nil), value.Action.ToolArgs...)
+	return &out
 }
 
 func copyMap(src map[string]any) map[string]any {

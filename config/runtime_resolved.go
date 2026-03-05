@@ -215,6 +215,8 @@ func ResolveRuntime(overrides RuntimeOverrides) (ResolvedRuntimeConfig, error) {
 			SnapshotTimeout:         time.Duration(cfg.State.TimeoutMs) * time.Millisecond,
 			Deterministic:           cfg.Agent.Deterministic,
 			EnabledSkills:           cloneStrings(cfg.Skills),
+			RequireToolApproval:     cfg.Agent.RequireToolApproval,
+			ToolApprovalAutoApprove: cloneStrings(cfg.Agent.ApprovalAutoApproveTools),
 		},
 
 		ToolErrorDefaultMode: toolErrorDefault,

@@ -72,6 +72,7 @@ type Registry struct {
 }
 
 var _ core.ToolRegistry = (*Registry)(nil)
+var _ core.ToolMutabilityInspector = (*Registry)(nil)
 
 // dedupEntry хранит запись дедупликации для mutating-инструмента.
 type dedupEntry struct {
@@ -180,6 +181,26 @@ func (r *Registry) Specs() []Spec {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+// IsReadOnlyTool возвращает mutability-информацию инструмента для approval/policy слоев.
+func (r *Registry) IsReadOnlyTool(name string) (bool, bool) {
+	cleanName := strings.TrimSpace(name)
+	if cleanName == "" {
+		return false, false
+	}
+	r.mu.RLock()
+	tool, ok := r.tools[cleanName]
+	r.mu.RUnlock()
+	if !ok {
+		return false, false
+	}
+	retryPolicy, ok := tool.(RetryPolicy)
+	if !ok {
+		// Если инструмент не декларирует mutability явно, трактуем его как потенциально mutating.
+		return false, true
+	}
+	return retryPolicy.IsReadOnly(), true
 }
 
 // Execute валидирует политику и аргументы, затем запускает инструмент с тайм-аутом и ретраями.

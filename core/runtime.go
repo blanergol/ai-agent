@@ -28,6 +28,8 @@ type RuntimeConfig struct {
 	Deterministic           bool
 	PromptHints             []string
 	EnabledSkills           []string
+	RequireToolApproval     bool
+	ToolApprovalAutoApprove []string
 }
 
 // RuntimeDeps are runtime dependencies exposed as interfaces.
@@ -94,6 +96,7 @@ func NewRuntime(cfg RuntimeConfig, deps RuntimeDeps, pipeline *Pipeline) *Runtim
 		pipeline = NewPipeline()
 	}
 	cfg.EnabledSkills = normalizeUniqueStrings(cfg.EnabledSkills)
+	cfg.ToolApprovalAutoApprove = normalizeToolNames(cfg.ToolApprovalAutoApprove)
 	return &Runtime{
 		cfg:      cfg,
 		deps:     deps,
@@ -105,10 +108,30 @@ func NewRuntime(cfg RuntimeConfig, deps RuntimeDeps, pipeline *Pipeline) *Runtim
 func (r *Runtime) Run(ctx context.Context, in RunInput) (RunResult, error) {
 	rawInput := in.Text
 	in.Text = strings.TrimSpace(in.Text)
-	if in.Text == "" {
+	if in.Approval != nil {
+		in.Approval.Normalize()
+		if strings.TrimSpace(in.Approval.RequestID) == "" {
+			return RunResult{}, apperrors.New(apperrors.CodeValidation, "approval.request_id is required", false)
+		}
+		if !in.Approval.IsValidDecision() {
+			return RunResult{}, apperrors.New(
+				apperrors.CodeValidation,
+				"approval.decision must be approve or deny",
+				false,
+			)
+		}
+	}
+	if in.Text == "" && in.Approval == nil {
 		return RunResult{}, apperrors.New(apperrors.CodeBadRequest, "empty input", false)
 	}
-	if len(in.Text) > r.cfg.MaxInputChars {
+	if in.Text == "" && in.Approval != nil && strings.TrimSpace(in.SessionID) == "" {
+		return RunResult{}, apperrors.New(
+			apperrors.CodeValidation,
+			"session_id is required when submitting approval decision",
+			false,
+		)
+	}
+	if in.Text != "" && len(in.Text) > r.cfg.MaxInputChars {
 		return RunResult{}, apperrors.New(
 			apperrors.CodeValidation,
 			fmt.Sprintf("input exceeds max chars: %d", r.cfg.MaxInputChars),
@@ -156,12 +179,25 @@ func (r *Runtime) Run(ctx context.Context, in RunInput) (RunResult, error) {
 		Guardrails:    runGuardrails,
 		State:         NewAgentState(rawInput),
 		ActionRepeats: make(map[string]int),
+		Approval:      in.Approval,
 	}
 	run.State.NormalizedInput = in.Text
 	run.State.Budgets.TimeLimit = r.cfg.MaxStepTimeout
 
 	r.restoreSnapshot(ctx, run)
 	defer r.persistSnapshot(ctx, run)
+	if handled, result, err := r.handlePendingApproval(ctx, run); err != nil {
+		run.Notify(ctx, Event{Type: EventRunFailed, Error: redact.Error(err)})
+		return RunResult{}, err
+	} else if handled {
+		run.Notify(ctx, Event{
+			Type:       EventRunCompleted,
+			Step:       result.Steps,
+			StopReason: result.StopReason,
+			OutputHash: shortHash(result.FinalResponse),
+		})
+		return result, nil
+	}
 
 	if err := run.ExecutePhase(ctx, PhaseInput, nil); err != nil {
 		run.Notify(ctx, Event{Type: EventRunFailed, Error: redact.Error(err)})
@@ -170,9 +206,11 @@ func (r *Runtime) Run(ctx context.Context, in RunInput) (RunResult, error) {
 	if normalized := strings.TrimSpace(run.State.NormalizedInput); normalized != "" {
 		run.Input.Text = normalized
 	}
-	if err := run.Memory.AddUserMessage(ctx, run.Input.Text); err != nil {
-		run.Notify(ctx, Event{Type: EventRunFailed, Error: redact.Error(err)})
-		return RunResult{}, err
+	if strings.TrimSpace(run.Input.Text) != "" {
+		if err := run.Memory.AddUserMessage(ctx, run.Input.Text); err != nil {
+			run.Notify(ctx, Event{Type: EventRunFailed, Error: redact.Error(err)})
+			return RunResult{}, err
+		}
 	}
 	run.Notify(ctx, Event{Type: EventRunStarted, InputHash: shortHash(run.Input.Text)})
 
@@ -238,8 +276,17 @@ func (r *Runtime) restoreSnapshot(ctx context.Context, run *RunContext) {
 		return
 	}
 	run.Memory.RestoreShortTerm(snapshot.ShortTermMessages)
-	// Guardrails лимиты применяются к одному Run-вызову и не должны
-	// переноситься между HTTP-запросами одной сессии.
+	run.Guardrails.Restore(snapshot.Guardrails)
+	run.PendingStop = snapshot.PendingStop
+	run.PendingStopReason = strings.TrimSpace(snapshot.PendingStopReason)
+	run.PendingFinalResponse = strings.TrimSpace(snapshot.PendingFinalResponse)
+	run.PendingApproval = copyPendingApproval(snapshot.PendingApproval)
+	run.PlanningSteps = copyPlanningSteps(snapshot.PlanningSteps)
+	run.CalledTools = copyStrings(snapshot.CalledTools)
+	if run.State != nil {
+		run.State.Context = copyMap(snapshot.StateContext)
+		run.State.RetrievedDocs = copyStrings(snapshot.RetrievedDocs)
+	}
 }
 
 func (r *Runtime) persistSnapshot(ctx context.Context, run *RunContext) {
@@ -249,12 +296,104 @@ func (r *Runtime) persistSnapshot(ctx context.Context, run *RunContext) {
 	saveCtx, cancel := context.WithTimeout(ctx, r.cfg.SnapshotTimeout)
 	defer cancel()
 	_ = r.deps.SnapshotStore.Save(saveCtx, RuntimeSnapshot{
-		APIVersion:        APIVersion,
-		SessionID:         run.Meta.SessionID,
-		ShortTermMessages: run.Memory.ShortTermSnapshot(),
-		Guardrails:        GuardrailsSnapshot{},
-		UpdatedAt:         time.Now().UTC(),
+		APIVersion:           APIVersion,
+		SessionID:            run.Meta.SessionID,
+		ShortTermMessages:    run.Memory.ShortTermSnapshot(),
+		Guardrails:           run.Guardrails.Snapshot(),
+		PendingStop:          run.PendingStop,
+		PendingStopReason:    strings.TrimSpace(run.PendingStopReason),
+		PendingFinalResponse: strings.TrimSpace(run.PendingFinalResponse),
+		PendingApproval:      copyPendingApproval(run.PendingApproval),
+		PlanningSteps:        copyPlanningSteps(run.PlanningSteps),
+		CalledTools:          copyStrings(run.CalledTools),
+		StateContext: func() map[string]any {
+			if run.State == nil {
+				return nil
+			}
+			return copyMap(run.State.Context)
+		}(),
+		RetrievedDocs: func() []string {
+			if run.State == nil {
+				return nil
+			}
+			return copyStrings(run.State.RetrievedDocs)
+		}(),
+		UpdatedAt: time.Now().UTC(),
 	})
+}
+
+func (r *Runtime) handlePendingApproval(_ context.Context, run *RunContext) (bool, RunResult, error) {
+	if run == nil {
+		return false, RunResult{}, nil
+	}
+	if run.PendingApproval == nil {
+		if run.Approval != nil {
+			return false, RunResult{}, apperrors.New(
+				apperrors.CodeValidation,
+				"no pending approval request for this session",
+				false,
+			)
+		}
+		return false, RunResult{}, nil
+	}
+	decision := run.Approval
+	if decision == nil {
+		reason := strings.TrimSpace(run.PendingStopReason)
+		if reason == "" {
+			reason = StopReasonAwaitingHumanApproval
+		}
+		final := strings.TrimSpace(run.PendingFinalResponse)
+		if final == "" {
+			final = fmt.Sprintf(
+				"Tool %q requires approval before execution. request_id=%s",
+				strings.TrimSpace(run.PendingApproval.Action.ToolName),
+				strings.TrimSpace(run.PendingApproval.RequestID),
+			)
+		}
+		run.PendingStop = true
+		run.PendingStopReason = reason
+		run.PendingFinalResponse = final
+		run.StopReason = reason
+		run.FinalResponse = final
+		return true, run.BuildResult(), nil
+	}
+	if !strings.EqualFold(decision.RequestID, run.PendingApproval.RequestID) {
+		return false, RunResult{}, apperrors.New(
+			apperrors.CodeValidation,
+			"approval.request_id does not match pending request",
+			false,
+		)
+	}
+	switch strings.ToLower(strings.TrimSpace(decision.Decision)) {
+	case ApprovalDecisionApprove:
+		action := run.PendingApproval.Action
+		run.ResumeAction = &action
+		run.ResumeActionDone = run.PendingApproval.Done
+		run.SkipApprovalOnce = true
+		run.PendingStop = false
+		run.PendingStopReason = ""
+		run.PendingFinalResponse = ""
+		run.PendingApproval = nil
+		return false, RunResult{}, nil
+	case ApprovalDecisionDeny:
+		final := "Tool execution was denied by reviewer."
+		if strings.TrimSpace(decision.Comment) != "" {
+			final += " " + strings.TrimSpace(decision.Comment)
+		}
+		run.PendingApproval = nil
+		run.PendingStop = true
+		run.PendingStopReason = StopReasonApprovalDenied
+		run.PendingFinalResponse = final
+		run.StopReason = StopReasonApprovalDenied
+		run.FinalResponse = final
+		return true, run.BuildResult(), nil
+	default:
+		return false, RunResult{}, apperrors.New(
+			apperrors.CodeValidation,
+			"approval.decision must be approve or deny",
+			false,
+		)
+	}
 }
 
 func shortHash(text string) string {
@@ -279,6 +418,30 @@ func normalizeUniqueStrings(values []string) []string {
 		if !seen {
 			out = append(out, candidate)
 		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func normalizeToolNames(values []string) []string {
+	normalized := normalizeUniqueStrings(values)
+	if len(normalized) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(normalized))
+	seen := make(map[string]struct{}, len(normalized))
+	for _, value := range normalized {
+		candidate := strings.ToLower(strings.TrimSpace(value))
+		if candidate == "" {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		out = append(out, candidate)
 	}
 	if len(out) == 0 {
 		return nil

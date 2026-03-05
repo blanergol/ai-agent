@@ -35,6 +35,22 @@ type fakeVerifier struct {
 	calls     int
 }
 
+type sequenceRunner struct {
+	results []core.RunResult
+	calls   int
+}
+
+func (s *sequenceRunner) Run(_ context.Context, _ core.RunInput) (core.RunResult, error) {
+	s.calls++
+	if s.calls <= len(s.results) {
+		return s.results[s.calls-1], nil
+	}
+	if len(s.results) == 0 {
+		return core.RunResult{}, nil
+	}
+	return s.results[len(s.results)-1], nil
+}
+
 func (f *fakeVerifier) Verify(_ context.Context, _ string) (oauth21.Principal, error) {
 	f.calls++
 	if f.err != nil {
@@ -184,5 +200,68 @@ func TestAPIServerUsesOAuthSubject(t *testing.T) {
 	}
 	if runner.lastSub != "oauth-user" {
 		t.Fatalf("user_sub = %s, want oauth-user", runner.lastSub)
+	}
+}
+
+func TestAPIServerFirstOnlyAllowsApprovalContinuation(t *testing.T) {
+	runner := &sequenceRunner{
+		results: []core.RunResult{
+			{
+				FinalResponse: "approval required",
+				StopReason:    core.StopReasonAwaitingHumanApproval,
+				SessionID:     "session-1",
+				PendingApproval: &core.PendingToolApproval{
+					RequestID: "apr-1",
+					Action: core.Action{
+						Type:     core.ActionTypeTool,
+						ToolName: "kv.put",
+					},
+				},
+			},
+			{
+				FinalResponse: "done",
+				StopReason:    "planner_done",
+				SessionID:     "session-1",
+			},
+		},
+	}
+	srv := newAPIServer(runner, nil, "", nil, true, false)
+	h := srv.routes()
+
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/agent/run", strings.NewReader(`{"input":"start","session_id":"session-1"}`))
+	w1 := httptest.NewRecorder()
+	h.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first status = %d", w1.Code)
+	}
+
+	req2 := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/agent/run",
+		strings.NewReader(`{"session_id":"session-1","approval":{"request_id":"apr-1","decision":"approve"}}`),
+	)
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second status = %d", w2.Code)
+	}
+	if runner.calls != 2 {
+		t.Fatalf("runner calls = %d, want 2", runner.calls)
+	}
+}
+
+func TestAPIServerRejectsApprovalWithoutSessionID(t *testing.T) {
+	srv := newAPIServer(&fakeRunner{}, nil, "", nil, false, false)
+	h := srv.routes()
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/agent/run",
+		strings.NewReader(`{"approval":{"request_id":"apr-1","decision":"approve"}}`),
+	)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
 	}
 }

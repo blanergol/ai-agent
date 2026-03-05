@@ -24,6 +24,29 @@ func (s *PlanStage) Run(ctx context.Context, run *core.RunContext) (core.StageRe
 	if run.PendingStop {
 		return core.Continue(), nil
 	}
+	if run.ResumeAction != nil {
+		run.NextAction = core.NextAction{
+			Done:   run.ResumeActionDone,
+			Action: *run.ResumeAction,
+		}
+		run.ResumeAction = nil
+		run.ResumeActionDone = false
+		run.PlanningSteps = append(run.PlanningSteps, core.PlanningStep{
+			Step:             run.CurrentStep,
+			ActionType:       strings.TrimSpace(run.NextAction.Action.Type),
+			ToolName:         strings.TrimSpace(run.NextAction.Action.ToolName),
+			ReasoningSummary: "resumed from approved pending action",
+			ExpectedOutcome:  strings.TrimSpace(run.NextAction.Action.ExpectedOutcome),
+			Done:             run.NextAction.Done,
+		})
+		run.Notify(ctx, core.Event{
+			Type:       core.EventStepPlanned,
+			Step:       run.CurrentStep,
+			ActionType: run.NextAction.Action.Type,
+			ToolName:   run.NextAction.Action.ToolName,
+		})
+		return core.Continue(), nil
+	}
 	var next core.NextAction
 	if err := run.ExecutePhase(ctx, core.PhaseDecideAction, func(ctx context.Context) error {
 		if run.State != nil {

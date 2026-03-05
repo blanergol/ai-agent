@@ -248,6 +248,10 @@ type AgentConfig struct {
 	Deterministic bool `mapstructure:"deterministic"`
 	// MCPEnrichmentSources задаёт детерминированные MCP-вызовы для фазы ENRICH_CONTEXT.
 	MCPEnrichmentSources []MCPEnrichmentSource `mapstructure:"mcp_enrichment_sources"`
+	// RequireToolApproval включает human approval для mutating tool calls.
+	RequireToolApproval bool `mapstructure:"require_tool_approval"`
+	// ApprovalAutoApproveTools задаёт CSV-список tool names, которые можно выполнять без approval.
+	ApprovalAutoApproveTools []string `mapstructure:"approval_auto_approve_tools"`
 }
 
 // MCPEnrichmentSource describes one deterministic enrichment tool call.
@@ -409,6 +413,7 @@ func DefaultConfig() Config {
 			ToolErrorFallback:   map[string]string{},
 			MaxInputChars:       8000,
 			Deterministic:       false,
+			RequireToolApproval: true,
 		},
 		Auth: AuthConfig{
 			UserAuthHeader: "X-User-Sub",
@@ -673,6 +678,14 @@ func applyEnv(cfg *Config) error {
 	} else if ok {
 		cfg.Agent.Deterministic = v
 	}
+	if v, ok, err := helpers.EnvBool("AGENT_CORE_AGENT_REQUIRE_TOOL_APPROVAL"); err != nil {
+		return err
+	} else if ok {
+		cfg.Agent.RequireToolApproval = v
+	}
+	if v, ok := helpers.EnvCSV("AGENT_CORE_AGENT_APPROVAL_AUTO_APPROVE_TOOLS"); ok {
+		cfg.Agent.ApprovalAutoApproveTools = v
+	}
 	if raw, ok := os.LookupEnv("AGENT_CORE_AGENT_MCP_ENRICHMENT_SOURCES"); ok {
 		sources, err := parseMCPEnrichmentSources(raw)
 		if err != nil {
@@ -892,6 +905,9 @@ func applyDerivedDefaults(cfg *Config) {
 	if cfg.State.TimeoutMs <= 0 {
 		cfg.State.TimeoutMs = 1500
 	}
+	if strings.TrimSpace(cfg.State.PersistPath) == "" && !strings.EqualFold(strings.TrimSpace(cfg.Mode), "test") {
+		cfg.State.PersistPath = filepath.Join("data", "agent-state.sqlite")
+	}
 	if strings.TrimSpace(cfg.State.CacheBackplaneDir) == "" && strings.TrimSpace(cfg.State.PersistPath) != "" {
 		cfg.State.CacheBackplaneDir = filepath.Join(filepath.Dir(cfg.State.PersistPath), "cache-backplane")
 	}
@@ -921,6 +937,7 @@ func applyDerivedDefaults(cfg *Config) {
 	if cfg.Agent.ToolErrorFallback == nil {
 		cfg.Agent.ToolErrorFallback = map[string]string{}
 	}
+	cfg.Agent.ApprovalAutoApproveTools = normalizeUniqueStrings(cfg.Agent.ApprovalAutoApproveTools)
 	cfg.Auth.OAuth21.RequiredScopes = normalizeUniqueStrings(cfg.Auth.OAuth21.RequiredScopes)
 	cfg.Auth.OAuth21.AllowedAlgs = normalizeUniqueStrings(cfg.Auth.OAuth21.AllowedAlgs)
 	if len(cfg.Auth.OAuth21.AllowedAlgs) == 0 {
